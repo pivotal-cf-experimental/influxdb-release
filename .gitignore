@@ -1,0 +1,10 @@
+.blobs
+.bundle
+.cache
+.dev_builds
+.final_builds
+.idea
+blobs
+config/dev.yml
+config/private.yml
+dev_releases

@@ -1,0 +1,8 @@
+---
+name: influxdb
+templates:
+  influxd_ctl.erb: bin/influxd_ctl
+  influxdb.conf.erb: config/influxdb.conf
+
+packages:
+- influxdb

@@ -1,0 +1,8 @@
+---
+name: influxdb
+
+dependencies:
+- go
+
+files:
+- influxdb/**/*
