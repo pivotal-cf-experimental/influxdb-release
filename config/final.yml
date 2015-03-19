@@ -1,3 +1,4 @@
+final_name: influxdb
 blobstore:
   provider: s3
   options:
