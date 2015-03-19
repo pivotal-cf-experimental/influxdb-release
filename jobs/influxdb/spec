@@ -6,3 +6,22 @@ templates:
 
 packages:
 - influxdb
+- bootstrapper
+
+properties:
+  influxdb.ips:
+    description: "an array of the ips for influxdb"
+  influxdb.database:
+    description: "database name in influxdb to create"
+  influxdb.user:
+    default: "root"
+    description: "influx user"
+  influxdb.password:
+    default: "root"
+    description: "influx user's password"
+  influxdb.retention:
+    default: "14d"
+    description: "default retention period for database"
+  influxdb.replication:
+    default: "1"
+    description: "default replication count for database"

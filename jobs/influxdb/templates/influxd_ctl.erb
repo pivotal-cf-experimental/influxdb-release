@@ -70,6 +70,9 @@ name=influxd
 # Daemon name, where is the actual executable
 daemon=/var/vcap/packages/influxdb/influxd
 
+# Boostrapper where is the actual executable
+bootstrapper=/var/vcap/packages/bootstrapper/bootstrapper
+
 # pid file for the daemon
 pidfile=/var/vcap/store/influxdb/influxd.pid
 
@@ -111,6 +114,17 @@ case $1 in
             nohup $daemon run -config $config -pidfile $pidfile > $STDOUT 2>&1 &
         fi
         log_success_msg "$name process was started"
+
+        bootstrapper -user <%= p('influxdb.user') %> -password <%= p('influxdb.password') %> -database <%= p('influxdb.database') %> -retention <%= p('influxdb.retention') %> -replication <%= p('influxdb.replication') %>
+
+        if [ $? -ne 0 ]; then
+          log_failure_msg "failed to boostrap db"
+          killproc -p $pidfile SIGTERM && /bin/rm -rf $pidfile
+          exit 1
+        fi
+
+        log_success_msg "succesfully boostrapped db"
+
         ;;
 
     stop)

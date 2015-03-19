@@ -1,0 +1,8 @@
+---
+name: bootstrapper
+
+dependencies:
+- go
+
+files:
+- bootstrapper/**/*
