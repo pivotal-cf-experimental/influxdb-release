@@ -1,10 +1,9 @@
 # abort script on any command that exits with a non zero value
 set -e
 
-cd bootstrapper
 
 export GOROOT=$(readlink -nf /var/vcap/packages/go)
-export GOPATH=$PWD
+export GOPATH=${PWD}/bootstrapper:${PWD}/influxdb
 export GOBIN=${BOSH_INSTALL_TARGET}
 export PATH=$PATH:$GOROOT/bin
 
