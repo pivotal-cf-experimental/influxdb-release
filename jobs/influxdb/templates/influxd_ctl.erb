@@ -115,7 +115,8 @@ case $1 in
         fi
         log_success_msg "$name process was started"
 
-        bootstrapper -user <%= p('influxdb.user') %> -password <%= p('influxdb.password') %> -database <%= p('influxdb.database') %> -retention <%= p('influxdb.retention') %> -replication <%= p('influxdb.replication') %>
+        sleep 5
+        $bootstrapper -user <%= p('influxdb.user') %> -password <%= p('influxdb.password') %> -database <%= p('influxdb.database') %> -retention <%= p('influxdb.retention') %> -replication <%= p('influxdb.replication') %>
 
         if [ $? -ne 0 ]; then
           log_failure_msg "failed to boostrap db"
