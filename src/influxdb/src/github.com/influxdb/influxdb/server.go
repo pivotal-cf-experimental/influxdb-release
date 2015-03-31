@@ -93,6 +93,10 @@ type Server struct {
 	// is just getting the request after being off duty for running CQs then
 	// it will recompute all of them
 	lastContinuousQueryRun time.Time
+
+	// Build information.
+	Version    string
+	CommitHash string
 }
 
 // NewServer returns a new instance of Server.
@@ -157,11 +161,6 @@ func (s *Server) metaPath() string {
 		return ""
 	}
 	return filepath.Join(s.path, "meta")
-}
-
-// SetLogOutput sets writer for all Server log output.
-func (s *Server) SetLogOutput(w io.Writer) {
-	s.Logger = log.New(w, "[server] ", log.LstdFlags)
 }
 
 // Open initializes the server from a given path.
@@ -264,6 +263,12 @@ func (s *Server) close() error {
 		_ = sh.close()
 	}
 
+	// Server is closing, empty maps which should be reloaded on open.
+	s.shards = nil
+	s.dataNodes = nil
+	s.databases = nil
+	s.users = nil
+
 	return nil
 }
 
@@ -296,11 +301,16 @@ func (s *Server) load() error {
 			}
 		}
 
-		// Open all shards owned by server.
+		// Load shards.
+		s.shards = make(map[uint64]*Shard)
 		for _, db := range s.databases {
 			for _, rp := range db.policies {
 				for _, g := range rp.shardGroups {
 					for _, sh := range g.Shards {
+						// Add to lookups.
+						s.shards[sh.ID] = sh
+
+						// Only open shards owned by the server.
 						if !sh.HasDataNodeID(s.id) {
 							continue
 						}
@@ -308,6 +318,7 @@ func (s *Server) load() error {
 						if err := sh.open(s.shardPath(sh.ID), s.client.Conn(sh.ID)); err != nil {
 							return fmt.Errorf("cannot open shard store: id=%d, err=%s", sh.ID, err)
 						}
+						s.stats.Inc("shardsOpen")
 					}
 				}
 			}
@@ -323,9 +334,33 @@ func (s *Server) load() error {
 	})
 }
 
+// StartSelfMonitoring starts a goroutine which monitors the InfluxDB server
+// itself and stores the results in the specified database at a given interval.
 func (s *Server) StartSelfMonitoring(database, retention string, interval time.Duration) error {
 	if interval == 0 {
 		return fmt.Errorf("statistics check interval must be non-zero")
+	}
+
+	// Function for local use turns stats into a slice of points
+	pointsFromStats := func(st *Stats, tags map[string]string) []Point {
+
+		var points []Point
+		now := time.Now()
+		st.Walk(func(k string, v int64) {
+			point := Point{
+				Timestamp: now,
+				Name:      st.name + "_" + k,
+				Tags:      make(map[string]string),
+				Fields:    map[string]interface{}{"value": int(v)},
+			}
+			// Specifically create a new map.
+			for k, v := range tags {
+				point.Tags[k] = v
+			}
+			points = append(points, point)
+		})
+
+		return points
 	}
 
 	go func() {
@@ -333,16 +368,33 @@ func (s *Server) StartSelfMonitoring(database, retention string, interval time.D
 		for {
 			<-tick.C
 
-			// Create the data point and write it.
-			point := Point{
-				Name:   s.stats.Name(),
-				Tags:   map[string]string{"raftID": strconv.FormatUint(s.id, 10)},
-				Fields: make(map[string]interface{}),
+			// Create the batch and tags
+			tags := map[string]string{"serverID": strconv.FormatUint(s.ID(), 10)}
+			if h, err := os.Hostname(); err == nil {
+				tags["host"] = h
 			}
-			s.stats.Walk(func(k string, v int64) {
-				point.Fields[k] = int(v)
-			})
-			s.WriteSeries(database, retention, []Point{point})
+			batch := pointsFromStats(s.stats, tags)
+
+			// Shard-level stats.
+			tags["shardID"] = strconv.FormatUint(s.id, 10)
+			for _, sh := range s.shards {
+				batch = append(batch, pointsFromStats(sh.stats, tags)...)
+			}
+
+			// Server diagnostics.
+			for _, row := range s.DiagnosticsAsRows() {
+				points, err := s.convertRowToPoints(row.Name, row)
+				if err != nil {
+					s.Logger.Printf("failed to write diagnostic row for %s: %s", row.Name, err.Error())
+					continue
+				}
+				for _, p := range points {
+					p.Tags = map[string]string{"serverID": strconv.FormatUint(s.ID(), 10)}
+				}
+				batch = append(batch, points...)
+			}
+
+			s.WriteSeries(database, retention, batch)
 		}
 	}()
 
@@ -380,7 +432,7 @@ func (s *Server) EnforceRetentionPolicies() {
 		ID        uint64
 	}
 
-	groups := make([]group, 0)
+	var groups []group
 	// Only keep the lock while walking the shard groups, so the lock is not held while
 	// any deletions take place across the cluster.
 	func() {
@@ -445,7 +497,7 @@ func (s *Server) ShardGroupPreCreate(checkInterval time.Duration) {
 		Timestamp time.Time
 	}
 
-	groups := make([]group, 0)
+	var groups []group
 	// Only keep the lock while walking the shard groups, so the lock is not held while
 	// any deletions take place across the cluster.
 	func() {
@@ -506,14 +558,34 @@ func (s *Server) broadcast(typ messaging.MessageType, c interface{}) (uint64, er
 	}
 
 	// Wait for the server to receive the message.
-	err = s.Sync(index)
+	err = s.Sync(BroadcastTopicID, index)
 
 	return index, err
 }
 
 // Sync blocks until a given index (or a higher index) has been applied.
 // Returns any error associated with the command.
-func (s *Server) Sync(index uint64) error {
+func (s *Server) Sync(topicID, index uint64) error {
+	// Sync to the broadcast topic if specified.
+	if topicID == 0 {
+		return s.syncBroadcast(index)
+	}
+
+	// Otherwise retrieve shard by id.
+	s.mu.RLock()
+	sh := s.shards[topicID]
+	s.mu.RUnlock()
+
+	// Return error if there is no shard.
+	if sh == nil || sh.store == nil {
+		return errors.New("shard not owned")
+	}
+
+	return sh.sync(index)
+}
+
+// syncBroadcast syncs the broadcast topic.
+func (s *Server) syncBroadcast(index uint64) error {
 	for {
 		// Check if index has occurred. If so, retrieve the error and return.
 		s.mu.RLock()
@@ -563,6 +635,13 @@ func (s *Server) Initialize(u url.URL) error {
 type dataNodeJSON struct {
 	ID  uint64 `json:"id"`
 	URL string `json:"url"`
+}
+
+// copyURL returns a copy of the the URL.
+func copyURL(u *url.URL) *url.URL {
+	other := &url.URL{}
+	*other = *u
+	return other
 }
 
 // Join creates a new data node in an existing cluster, copies the metastore,
@@ -1304,10 +1383,11 @@ func (s *Server) RetentionPolicies(database string) ([]*RetentionPolicy, error) 
 	}
 
 	// Retrieve the policies.
-	a := make([]*RetentionPolicy, 0, len(db.policies))
+	a := make(RetentionPolicies, 0, len(db.policies))
 	for _, p := range db.policies {
 		a = append(a, p)
 	}
+	sort.Sort(a)
 	return a, nil
 }
 
@@ -1336,7 +1416,7 @@ func (s *Server) CreateRetentionPolicy(database string, rp *RetentionPolicy) err
 	return err
 }
 
-// CreateRetentionPolicy creates a retention policy for a database.
+// CreateRetentionPolicyIfNotExists creates a retention policy for a database.
 func (s *Server) CreateRetentionPolicyIfNotExists(database string, rp *RetentionPolicy) error {
 	// Ensure retention policy exists.
 	if !s.RetentionPolicyExists(database, rp.Name) {
@@ -1729,7 +1809,7 @@ func (s *Server) createMeasurementsIfNotExists(database, retentionPolicy string,
 					if f := measurement.FieldByName(k); f != nil {
 						// Field present in Metastore, make sure there is no type conflict.
 						if f.Type != influxql.InspectDataType(v) {
-							return fmt.Errorf(fmt.Sprintf("field \"%s\" is type %T, mapped as type %s", k, v, f.Type))
+							return fmt.Errorf("field \"%s\" is type %T, mapped as type %s", k, v, f.Type)
 						}
 						continue // Field is present, and it's of the same type. Nothing more to do.
 					}
@@ -1818,6 +1898,7 @@ func (s *Server) applyCreateMeasurementsIfNotExists(m *messaging.Message) error 
 	return nil
 }
 
+// DropMeasurement drops a given measurement from a database.
 func (s *Server) DropMeasurement(database, name string) error {
 	c := &dropMeasurementCommand{Database: database, Name: name}
 	_, err := s.broadcast(dropMeasurementMessageType, c)
@@ -1958,6 +2039,7 @@ func (s *Server) ExecuteQuery(q *influxql.Query, database string, user *User) Re
 
 	// Build empty resultsets.
 	results := Results{Results: make([]*Result, len(q.Statements))}
+	s.stats.Add("queriesRx", int64(len(q.Statements)))
 
 	// Execute each statement.
 	for i, stmt := range q.Statements {
@@ -2003,6 +2085,8 @@ func (s *Server) ExecuteQuery(q *influxql.Query, database string, user *User) Re
 			res = s.executeShowFieldKeysStatement(stmt, database, user)
 		case *influxql.ShowStatsStatement:
 			res = s.executeShowStatsStatement(stmt, user)
+		case *influxql.ShowDiagnosticsStatement:
+			res = s.executeShowDiagnosticsStatement(stmt, user)
 		case *influxql.GrantStatement:
 			res = s.executeGrantStatement(stmt, user)
 		case *influxql.RevokeStatement:
@@ -2030,6 +2114,7 @@ func (s *Server) ExecuteQuery(q *influxql.Query, database string, user *User) Re
 		if res.Err != nil {
 			break
 		}
+		s.stats.Inc("queriesExecuted")
 	}
 
 	// Fill any empty results after error.
@@ -2065,6 +2150,10 @@ func (s *Server) executeSelectStatement(stmt *influxql.SelectStatement, database
 	// Read all rows from channel.
 	res := &Result{Series: make([]*influxql.Row, 0)}
 	for row := range ch {
+		if row.Err != nil {
+			res.Err = row.Err
+			return res
+		}
 		res.Series = append(res.Series, row)
 	}
 
@@ -2073,36 +2162,132 @@ func (s *Server) executeSelectStatement(stmt *influxql.SelectStatement, database
 
 // rewriteSelectStatement performs any necessary query re-writing.
 func (s *Server) rewriteSelectStatement(stmt *influxql.SelectStatement) (*influxql.SelectStatement, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var err error
+
+	// Expand regex expressions in the FROM clause.
+	sources, err := s.expandSources(stmt.Sources)
+	if err != nil {
+		return nil, err
+	}
+	stmt.Sources = sources
+
+	// Expand wildcards in the fields or GROUP BY.
+	if stmt.HasWildcard() {
+		stmt, err = s.expandWildcards(stmt)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return stmt, nil
+}
+
+// expandWildcards returns a new SelectStatement with wildcards in the fields
+// and/or GROUP BY exapnded with actual field names.
+func (s *Server) expandWildcards(stmt *influxql.SelectStatement) (*influxql.SelectStatement, error) {
+	// If there are no wildcards in the statement, return it as-is.
 	if !stmt.HasWildcard() {
 		return stmt, nil
 	}
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	// Use sets to avoid duplicate field names.
+	fieldSet := map[string]struct{}{}
+	dimensionSet := map[string]struct{}{}
 
 	var fields influxql.Fields
 	var dimensions influxql.Dimensions
-	if measurement, ok := stmt.Source.(*influxql.Measurement); ok {
-		segments, err := influxql.SplitIdent(measurement.Name)
-		if err != nil {
-			return nil, fmt.Errorf("unable to parse measurement %s", measurement.Name)
-		}
-		db, m := segments[0], segments[2]
 
-		mm := s.databases[db].measurements[m]
-		if mm == nil {
-			return nil, fmt.Errorf("measurement not found: %s", measurement.Name)
-		}
+	// Iterate measurements in the FROM clause getting the fields & dimensions for each.
+	for _, src := range stmt.Sources {
+		if measurement, ok := src.(*influxql.Measurement); ok {
+			// Split the measurement name into its pieces (db, rp, & measurement).
+			segments, err := influxql.SplitIdent(measurement.Name)
+			if err != nil {
+				return nil, fmt.Errorf("unable to parse measurement %s", measurement.Name)
+			}
+			db, m := segments[0], segments[2]
 
-		for _, f := range mm.Fields {
-			fields = append(fields, &influxql.Field{Expr: &influxql.VarRef{Val: f.Name}})
-		}
-		for _, t := range mm.tagKeys() {
-			dimensions = append(dimensions, &influxql.Dimension{Expr: &influxql.VarRef{Val: t}})
+			// Lookup the measurement in the database.
+			mm := s.databases[db].measurements[m]
+			if mm == nil {
+				return nil, fmt.Errorf("measurement not found: %s", measurement.Name)
+			}
+
+			// Get the fields for this measurement.
+			for _, f := range mm.Fields {
+				if _, ok := fieldSet[f.Name]; ok {
+					continue
+				}
+				fieldSet[f.Name] = struct{}{}
+				fields = append(fields, &influxql.Field{Expr: &influxql.VarRef{Val: f.Name}})
+			}
+
+			// Get the dimensions for this measurement.
+			for _, t := range mm.tagKeys() {
+				if _, ok := dimensionSet[t]; ok {
+					continue
+				}
+				dimensionSet[t] = struct{}{}
+				dimensions = append(dimensions, &influxql.Dimension{Expr: &influxql.VarRef{Val: t}})
+			}
 		}
 	}
 
+	// Return a new SelectStatement with the wild cards rewritten.
 	return stmt.RewriteWildcards(fields, dimensions), nil
+}
+
+// expandSources expands regex sources and removes duplicates.
+func (s *Server) expandSources(sources influxql.Sources) (influxql.Sources, error) {
+	// Use a map as a set to prevent duplicates. Two regexes might produce
+	// duplicates when expanded.
+	set := map[string]influxql.Source{}
+
+	// Iterate all sources, expanding regexes when they're found.
+	for _, source := range sources {
+		switch src := source.(type) {
+		case *influxql.Measurement:
+			if src.Regex == nil {
+				set[src.Name] = src
+				continue
+			}
+
+			// Split out the database & retention policy names.
+			segments, err := influxql.SplitIdent(src.Name)
+			if err != nil {
+				return nil, err
+			}
+
+			// Lookup the database.
+			db := s.databases[segments[0]]
+			if db == nil {
+				return nil, ErrDatabaseNotFound
+			}
+
+			// Get measurements from the database that match the regex.
+			measurements := db.measurementsByRegex(src.Regex.Val)
+
+			// Add those measurments to the set.
+			for _, m := range measurements {
+				name := strings.Join([]string{src.Name, influxql.QuoteIdent([]string{m.Name})}, ".")
+				set[name] = &influxql.Measurement{Name: name}
+			}
+
+		default:
+			return nil, fmt.Errorf("expandSources: unsuported source type: %T", source)
+		}
+	}
+
+	// Convert set to a list of Sources.
+	expanded := make(influxql.Sources, 0, len(set))
+	for _, src := range set {
+		expanded = append(expanded, src)
+	}
+
+	return expanded, nil
 }
 
 // plans a selection statement under lock.
@@ -2125,7 +2310,7 @@ func (s *Server) executeDropDatabaseStatement(q *influxql.DropDatabaseStatement,
 }
 
 func (s *Server) executeShowDatabasesStatement(q *influxql.ShowDatabasesStatement, user *User) *Result {
-	row := &influxql.Row{Columns: []string{"name"}}
+	row := &influxql.Row{Name: "databases", Columns: []string{"name"}}
 	for _, name := range s.Databases() {
 		row.Values = append(row.Values, []interface{}{name})
 	}
@@ -2271,7 +2456,7 @@ func (s *Server) executeShowSeriesStatement(stmt *influxql.ShowSeriesStatement, 
 			}
 		}
 		// make the id the first column
-		r.Columns = append([]string{"id"}, r.Columns...)
+		r.Columns = append([]string{"_id"}, r.Columns...)
 
 		// Append the row to the result.
 		result.Series = append(result.Series, r)
@@ -2509,14 +2694,35 @@ func (s *Server) executeShowContinuousQueriesStatement(stmt *influxql.ShowContin
 }
 
 func (s *Server) executeShowStatsStatement(stmt *influxql.ShowStatsStatement, user *User) *Result {
-	row := &influxql.Row{Columns: []string{}}
-	row.Name = s.stats.Name()
+	var rows []*influxql.Row
+	// Server stats.
+	serverRow := &influxql.Row{Columns: []string{}}
+	serverRow.Name = s.stats.Name()
 	s.stats.Walk(func(k string, v int64) {
-		row.Columns = append(row.Columns, k)
-		row.Values = append(row.Values, []interface{}{v})
+		serverRow.Columns = append(serverRow.Columns, k)
+		serverRow.Values = append(serverRow.Values, []interface{}{v})
 	})
+	rows = append(rows, serverRow)
 
-	return &Result{Series: []*influxql.Row{row}}
+	// Shard-level stats.
+	for _, sh := range s.shards {
+		row := &influxql.Row{Columns: []string{}}
+		row.Name = sh.stats.Name()
+		sh.stats.Walk(func(k string, v int64) {
+			row.Columns = append(row.Columns, k)
+			row.Values = append(row.Values, []interface{}{v})
+		})
+		rows = append(rows, row)
+	}
+
+	return &Result{Series: rows}
+}
+
+func (s *Server) executeShowDiagnosticsStatement(stmt *influxql.ShowDiagnosticsStatement, user *User) *Result {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return &Result{Series: s.DiagnosticsAsRows()}
 }
 
 // filterMeasurementsByExpr filters a list of measurements by a tags expression.
@@ -2669,10 +2875,9 @@ func (s *Server) executeAlterRetentionPolicyStatement(stmt *influxql.AlterRetent
 		ReplicaN: func() *uint32 {
 			if stmt.Replication == nil {
 				return nil
-			} else {
-				n := uint32(*stmt.Replication)
-				return &n
 			}
+			n := uint32(*stmt.Replication)
+			return &n
 		}(),
 	}
 
@@ -2724,6 +2929,17 @@ func (s *Server) CreateContinuousQuery(q *influxql.CreateContinuousQueryStatemen
 	return err
 }
 
+func (s *Server) executeDropContinuousQueryStatement(q *influxql.DropContinuousQueryStatement, user *User) *Result {
+	return &Result{Err: s.DropContinuousQuery(q)}
+}
+
+// DropContinuousQuery dropsoa continuous query.
+func (s *Server) DropContinuousQuery(q *influxql.DropContinuousQueryStatement) error {
+	c := &dropContinuousQueryCommand{Name: q.Name, Database: q.Database}
+	_, err := s.broadcast(dropContinuousQueryMessageType, c)
+	return err
+}
+
 // ContinuousQueries returns a list of all continuous queries.
 func (s *Server) ContinuousQueries(database string) []*ContinuousQuery {
 	s.mu.RLock()
@@ -2749,20 +2965,6 @@ func (s *Server) MeasurementNames(database string) []string {
 
 	return db.names
 }
-
-/*
-func (s *Server) MeasurementSeriesIDs(database, measurement string) []uint32 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	db := s.databases[database]
-	if db == nil {
-		return nil
-	}
-
-	return []uint32(db.SeriesIDs([]string{measurement}, nil))
-}
-*/
 
 // measurement returns a measurement by database and name.
 func (s *Server) measurement(database, name string) (*Measurement, error) {
@@ -2795,13 +2997,14 @@ func (s *Server) normalizeStatement(stmt influxql.Statement, defaultDatabase str
 		}
 		switch n := n.(type) {
 		case *influxql.Measurement:
-			name, e := s.normalizeMeasurement(n.Name, defaultDatabase)
+			nm, e := s.normalizeMeasurement(n, defaultDatabase)
 			if e != nil {
 				err = e
 				return
 			}
-			prefixes[n.Name] = name
-			n.Name = name
+			prefixes[n.Name] = nm.Name
+			n.Name = nm.Name
+			n.Regex = nm.Regex
 		}
 	})
 	if err != nil {
@@ -2824,17 +3027,35 @@ func (s *Server) normalizeStatement(stmt influxql.Statement, defaultDatabase str
 }
 
 // NormalizeMeasurement inserts the default database or policy into all measurement names.
-func (s *Server) NormalizeMeasurement(name string, defaultDatabase string) (string, error) {
+func (s *Server) NormalizeMeasurement(m *influxql.Measurement, defaultDatabase string) (*influxql.Measurement, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.normalizeMeasurement(name, defaultDatabase)
+	return s.normalizeMeasurement(m, defaultDatabase)
 }
 
-func (s *Server) normalizeMeasurement(name string, defaultDatabase string) (string, error) {
-	// Split name into segments.
-	segments, err := influxql.SplitIdent(name)
-	if err != nil {
-		return "", fmt.Errorf("invalid measurement: %s", name)
+func (s *Server) normalizeMeasurement(m *influxql.Measurement, defaultDatabase string) (*influxql.Measurement, error) {
+	if m.Name == "" && m.Regex == nil {
+		return nil, errors.New("invalid measurement")
+	}
+
+	var segments []string
+	var err error
+
+	if m.Name != "" {
+		// Split measurement name into segments.
+		segments, err = influxql.SplitIdent(m.Name)
+		if err != nil {
+			return nil, fmt.Errorf("invalid measurement: %s", m.Name)
+		}
+	}
+
+	// Number of segments.
+	n := 3
+
+	// If there's a regex, add a placeholder segment
+	if m.Regex != nil {
+		segments = append(segments, "")
+		n = 2
 	}
 
 	// Normalize to 3 segments.
@@ -2846,34 +3067,106 @@ func (s *Server) normalizeMeasurement(name string, defaultDatabase string) (stri
 	case 3:
 		// nop
 	default:
-		return "", fmt.Errorf("invalid measurement: %s", name)
+		return nil, fmt.Errorf("measurement has too many segments: %s", m.String())
 	}
 
 	// Set database if unset.
-	if segment := segments[0]; segment == `` {
+	if segments[0] == `` {
 		segments[0] = defaultDatabase
 	}
 
 	// Find database.
 	db := s.databases[segments[0]]
 	if db == nil {
-		return "", fmt.Errorf("database not found: %s", segments[0])
+		return nil, fmt.Errorf("database not found: %s", segments[0])
 	}
 
 	// Set retention policy if unset.
-	if segment := segments[1]; segment == `` {
+	if segments[1] == `` {
 		if db.defaultRetentionPolicy == "" {
-			return "", fmt.Errorf("default retention policy not set for: %s", db.name)
+			return nil, fmt.Errorf("default retention policy not set for: %s", db.name)
 		}
 		segments[1] = db.defaultRetentionPolicy
 	}
 
 	// Check if retention policy exists.
 	if _, ok := db.policies[segments[1]]; !ok {
-		return "", fmt.Errorf("retention policy does not exist: %s.%s", segments[0], segments[1])
+		return nil, fmt.Errorf("retention policy does not exist: %s.%s", segments[0], segments[1])
 	}
 
-	return influxql.QuoteIdent(segments), nil
+	nm := &influxql.Measurement{
+		Name:  influxql.QuoteIdent(segments[:n]),
+		Regex: m.Regex,
+	}
+
+	return nm, nil
+}
+
+// DiagnosticsAsRows returns diagnostic information about the server, as a slice of
+// InfluxQL rows.
+func (s *Server) DiagnosticsAsRows() []*influxql.Row {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	now := time.Now().UTC()
+
+	// Common rows.
+	gd := NewGoDiagnostics()
+	sd := NewSystemDiagnostics()
+	md := NewMemoryDiagnostics()
+	bd := BuildDiagnostics{Version: s.Version, CommitHash: s.CommitHash}
+
+	// Common tagset.
+	tags := map[string]string{"serverID": strconv.FormatUint(s.id, 10)}
+
+	// Server row.
+	serverRow := &influxql.Row{
+		Name: "server_diag",
+		Columns: []string{"time", "startTime", "uptime", "id",
+			"path", "authEnabled", "index", "retentionAutoCreate", "numShards", "cqLastRun"},
+		Tags: tags,
+		Values: [][]interface{}{[]interface{}{now, startTime.String(), time.Since(startTime).String(), strconv.FormatUint(s.id, 10),
+			s.path, s.authenticationEnabled, int(s.index), s.RetentionAutoCreate, len(s.shards), s.lastContinuousQueryRun.String()}},
+	}
+
+	// Shard groups.
+	shardGroupsRow := &influxql.Row{Columns: []string{}}
+	shardGroupsRow.Name = "shardGroups_diag"
+	shardGroupsRow.Columns = append(shardGroupsRow.Columns, "time", "database", "retentionPolicy", "id",
+		"startTime", "endTime", "duration", "numShards")
+	shardGroupsRow.Tags = tags
+	// Check all shard groups.
+	for _, db := range s.databases {
+		for _, rp := range db.policies {
+			for _, g := range rp.shardGroups {
+				shardGroupsRow.Values = append(shardGroupsRow.Values, []interface{}{now, db.name, rp.Name,
+					strconv.FormatUint(g.ID, 10), g.StartTime.String(), g.EndTime.String(), g.Duration().String(), len(g.Shards)})
+			}
+		}
+	}
+
+	// Shards
+	shardsRow := &influxql.Row{Columns: []string{}}
+	shardsRow.Name = "shards_diag"
+	shardsRow.Columns = append(shardsRow.Columns, "time", "id", "dataNodes", "index", "path")
+	shardsRow.Tags = tags
+	for _, sh := range s.shards {
+		var nodes []string
+		for _, n := range sh.DataNodeIDs {
+			nodes = append(nodes, strconv.FormatUint(n, 10))
+			shardsRow.Values = append(shardsRow.Values, []interface{}{now, strconv.FormatUint(sh.ID, 10), strings.Join(nodes, ","),
+				strconv.FormatUint(sh.index, 10), sh.store.Path()})
+		}
+	}
+
+	return []*influxql.Row{
+		gd.AsRow("server_go", tags),
+		sd.AsRow("server_system", tags),
+		md.AsRow("server_memory", tags),
+		bd.AsRow("server_build", tags),
+		serverRow,
+		shardGroupsRow,
+		shardsRow,
+	}
 }
 
 // processor runs in a separate goroutine and processes all incoming broker messages.
@@ -2941,6 +3234,8 @@ func (s *Server) processor(conn MessagingConn, done chan struct{}) {
 				err = s.applySetPrivilege(m)
 			case createContinuousQueryMessageType:
 				err = s.applyCreateContinuousQueryCommand(m)
+			case dropContinuousQueryMessageType:
+				err = s.applyDropContinuousQueryCommand(m)
 			case dropSeriesMessageType:
 				err = s.applyDropSeries(m)
 			case writeRawSeriesMessageType:
@@ -3066,9 +3361,6 @@ type MessagingClient interface {
 
 	// Conn returns an open, streaming connection to a topic.
 	Conn(topicID uint64) MessagingConn
-
-	// Sets the logging destination.
-	SetLogOutput(w io.Writer)
 }
 
 type messagingClient struct {
@@ -3230,7 +3522,7 @@ func NewContinuousQuery(q string) (*ContinuousQuery, error) {
 
 	cq, ok := stmt.(*influxql.CreateContinuousQueryStatement)
 	if !ok {
-		return nil, errors.New("query isn't a continuous query")
+		return nil, errors.New("query isn't a valie continuous query")
 	}
 
 	cquery := &ContinuousQuery{
@@ -3300,6 +3592,44 @@ func (s *Server) applyCreateContinuousQueryCommand(m *messaging.Message) error {
 	return nil
 }
 
+// applyDropContinuousQueryCommand removes the continuous query from the database object and saves it to the metastore
+func (s *Server) applyDropContinuousQueryCommand(m *messaging.Message) error {
+	var c dropContinuousQueryCommand
+
+	mustUnmarshalJSON(m.Data, &c)
+
+	// retrieve the database and ensure that it exists
+	db := s.databases[c.Database]
+	if db == nil {
+		return ErrDatabaseNotFound
+	}
+
+	// loop through continuous queries and find the match
+	cqIndex := -1
+	for n, continuousQuery := range db.continuousQueries {
+		if continuousQuery.cq.Name == c.Name {
+			cqIndex = n
+			break
+		}
+	}
+
+	if cqIndex == -1 {
+		return ErrContinuousQueryNotFound
+	}
+
+	// delete the relevant continuous query
+	copy(db.continuousQueries[cqIndex:], db.continuousQueries[cqIndex+1:])
+	db.continuousQueries[len(db.continuousQueries)-1] = nil
+	db.continuousQueries = db.continuousQueries[:len(db.continuousQueries)-1]
+
+	// persist to metastore
+	s.meta.mustUpdate(m.Index, func(tx *metatx) error {
+		return tx.saveDatabase(db)
+	})
+
+	return nil
+}
+
 // RunContinuousQueries will run any continuous queries that are due to run and write the
 // results back into the database
 func (s *Server) RunContinuousQueries() error {
@@ -3328,7 +3658,7 @@ func (s *Server) RunContinuousQueries() error {
 // if this CQ should be run
 func (s *Server) shouldRunContinuousQuery(cq *ContinuousQuery) bool {
 	// if it's not aggregated we don't run it
-	if !cq.cq.Source.Aggregated() {
+	if cq.cq.Source.IsRawQuery {
 		return false
 	}
 
@@ -3472,26 +3802,21 @@ func (s *Server) convertRowToPoints(measurementName string, row *influxql.Row) (
 	return points, nil
 }
 
-// copyURL returns a copy of the the URL.
-func copyURL(u *url.URL) *url.URL {
-	other := &url.URL{}
-	*other = *u
-	return other
-}
-
-func (s *Server) StartReportingLoop(version string, clusterID uint64) chan struct{} {
-	s.reportStats(version, clusterID)
+// StartReportingLoop starts the anonymous usage reporting loop for a given
+// cluster ID.
+func (s *Server) StartReportingLoop(clusterID uint64) chan struct{} {
+	s.reportServer(clusterID)
 
 	ticker := time.NewTicker(24 * time.Hour)
 	for {
 		select {
 		case <-ticker.C:
-			s.reportStats(version, clusterID)
+			s.reportServer(clusterID)
 		}
 	}
 }
 
-func (s *Server) reportStats(version string, clusterID uint64) {
+func (s *Server) reportServer(clusterID uint64) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -3508,7 +3833,7 @@ func (s *Server) reportStats(version string, clusterID uint64) {
     "name":"reports",
     "columns":["os", "arch", "version", "server_id", "id", "num_series", "num_measurements", "num_databases"],
     "points":[["%s", "%s", "%s", "%x", "%x", "%d", "%d", "%d"]]
-  }]`, runtime.GOOS, runtime.GOARCH, version, s.ID(), clusterID, numSeries, numMeasurements, numDatabases)
+  }]`, runtime.GOOS, runtime.GOARCH, s.Version, s.ID(), clusterID, numSeries, numMeasurements, numDatabases)
 
 	data := bytes.NewBufferString(json)
 
@@ -3516,4 +3841,11 @@ func (s *Server) reportStats(version string, clusterID uint64) {
 
 	client := http.Client{Timeout: time.Duration(5 * time.Second)}
 	go client.Post("http://m.influxdb.com:8086/db/reporting/series?u=reporter&p=influxdb", "application/json", data)
+}
+
+// CreateSnapshotWriter returns a writer for the current snapshot.
+func (s *Server) CreateSnapshotWriter() (*SnapshotWriter, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return createServerSnapshotWriter(s)
 }

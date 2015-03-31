@@ -1,6 +1,7 @@
 package httpd_test
 
 import (
+	"archive/tar"
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
@@ -136,56 +137,27 @@ func TestBatchWrite_UnmarshalRFC(t *testing.T) {
 	}
 }
 
-func TestHandler_Databases(t *testing.T) {
+// Ensure that even if a measurement is not found, that the status code is still 200
+func TestHandler_ShowMeasurementsNotFound(t *testing.T) {
 	c := test.NewMessagingClient()
 	defer c.Close()
 	srvr := OpenAuthlessServer(c)
 	srvr.CreateDatabase("foo")
-	srvr.CreateDatabase("bar")
+	srvr.CreateRetentionPolicy("foo", influxdb.NewRetentionPolicy("bar"))
+	srvr.SetDefaultRetentionPolicy("foo", "bar")
 	s := NewHTTPServer(srvr)
 	defer s.Close()
 
-	status, body := MustHTTP("GET", s.URL+`/query`, map[string]string{"q": "SHOW DATABASES"}, nil, "")
+	status, body := MustHTTP("GET", s.URL+`/query`, map[string]string{"q": "SHOW SERIES from bin", "db": "foo"}, nil, "")
 	if status != http.StatusOK {
 		t.Fatalf("unexpected status: %d", status)
-	} else if body != `{"results":[{"series":[{"columns":["name"],"values":[["bar"],["foo"]]}]}]}` {
+	} else if body != `{"results":[{"error":"measurement \"bin\" not found"}]}` {
 		t.Fatalf("unexpected body: %s", body)
 	}
-}
-
-func TestHandler_DatabasesPrettyPrinted(t *testing.T) {
-	c := test.NewMessagingClient()
-	defer c.Close()
-	srvr := OpenAuthlessServer(c)
-	srvr.CreateDatabase("foo")
-	srvr.CreateDatabase("bar")
-	s := NewHTTPServer(srvr)
-	defer s.Close()
-
-	status, body := MustHTTP("GET", s.URL+`/query`, map[string]string{"q": "SHOW DATABASES", "pretty": "true"}, nil, "")
+	status, body = MustHTTP("GET", s.URL+`/query`, map[string]string{"q": "SELECT * FROM bin", "db": "foo"}, nil, "")
 	if status != http.StatusOK {
 		t.Fatalf("unexpected status: %d", status)
-	} else if body != `{
-    "results": [
-        {
-            "series": [
-                {
-                    "columns": [
-                        "name"
-                    ],
-                    "values": [
-                        [
-                            "bar"
-                        ],
-                        [
-                            "foo"
-                        ]
-                    ]
-                }
-            ]
-        }
-    ]
-}` {
+	} else if body != `{"results":[{"error":"measurement not found: \"foo\".\"bar\".\"bin\""}]}` {
 		t.Fatalf("unexpected body: %s", body)
 	}
 }
@@ -278,8 +250,8 @@ func TestHandler_RetentionPolicies(t *testing.T) {
 
 	if status != http.StatusOK {
 		t.Fatalf("unexpected status: %d", status)
-	} else if body != `{"results":[{"series":[{"columns":["name","duration","replicaN","default"],"values":[["bar","168h0m0s",1,false]]}]}]}` {
-		t.Fatalf("unexpected body: %s", body)
+	} else if !strings.Contains(body, `{"results":[{"series":[{"columns":["name","duration","replicaN","default"],"values":[["bar","168h0m0s",1,false],["default","0",1,true]]}]}]}`) {
+		t.Fatalf("Missing retention policy: %s", body)
 	}
 }
 
@@ -1118,16 +1090,54 @@ func TestHandler_DropSeries(t *testing.T) {
 func TestHandler_serveWriteSeries(t *testing.T) {
 	c := test.NewMessagingClient()
 	defer c.Close()
-	srvr := OpenAuthenticatedServer(c)
+	srvr := OpenAuthlessServer(c)
 	srvr.CreateDatabase("foo")
-	srvr.CreateRetentionPolicy("foo", influxdb.NewRetentionPolicy("bar"))
 	s := NewHTTPServer(srvr)
 	defer s.Close()
 
-	status, _ := MustHTTP("POST", s.URL+`/write`, nil, nil, `{"database" : "foo", "retentionPolicy" : "bar", "points": [{"name": "cpu", "tags": {"host": "server01"},"timestamp": "2009-11-10T23:00:00Z","fields": {"value": 100}}]}`)
+	status, _ := MustHTTP("POST", s.URL+`/write`, nil, nil, `{"database" : "foo", "retentionPolicy" : "default", "points": [{"name": "cpu", "tags": {"host": "server01"},"timestamp": "2009-11-10T23:00:00Z","fields": {"value": 100}}]}`)
 
 	if status != http.StatusOK {
-		t.Fatalf("unexpected status: %d", status)
+		t.Fatalf("unexpected status for post: %d", status)
+	}
+	query := map[string]string{"db": "foo", "q": "select * from cpu"}
+	status, body := MustHTTP("GET", s.URL+`/query`, query, nil, "")
+	if status != http.StatusOK {
+		t.Fatalf("unexpected status for get: %d", status)
+	}
+	if !strings.Contains(body, `"name":"cpu"`) {
+		t.Fatalf("Write doesn't match query results. Response body is %s.", body)
+	}
+}
+
+func TestHandler_serveDump(t *testing.T) {
+	c := test.NewMessagingClient()
+	defer c.Close()
+	srvr := OpenAuthlessServer(c)
+	srvr.CreateDatabase("foo")
+	s := NewHTTPServer(srvr)
+	defer s.Close()
+
+	status, _ := MustHTTP("POST", s.URL+`/write`, nil, nil, `{"database" : "foo", "retentionPolicy" : "default", "points": [{"name": "cpu", "tags": {"host": "server01"},"timestamp": "2009-11-10T23:00:00Z","fields": {"value": 100}}]}`)
+
+	if status != http.StatusOK {
+		t.Fatalf("unexpected status for post: %d", status)
+
+	}
+	query := map[string]string{"db": "foo", "q": "select * from cpu"}
+	status, body := MustHTTP("GET", s.URL+`/query`, query, nil, "")
+	if status != http.StatusOK {
+		t.Fatalf("unexpected status for get: %d", status)
+	}
+
+	time.Sleep(500 * time.Millisecond) // Shouldn't committed data be readable?
+	query = map[string]string{"db": "foo"}
+	status, body = MustHTTP("GET", s.URL+`/dump`, query, nil, "")
+	if status != http.StatusOK {
+		t.Fatalf("unexpected status for get: %d", status)
+	}
+	if !strings.Contains(body, `"name":"cpu"`) {
+		t.Fatalf("Write doesn't match query results. Response body is %s.", body)
 	}
 }
 
@@ -1189,6 +1199,93 @@ func TestHandler_serveWriteSeries_noDatabaseExists(t *testing.T) {
 	response := `{"error":"database not found: \"foo\""}`
 	if body != response {
 		t.Fatalf("unexpected body: expected %s, actual %s", response, body)
+	}
+}
+
+func TestHandler_serveWriteSeries_errorHasJsonContentType(t *testing.T) {
+	c := test.NewMessagingClient()
+	defer c.Close()
+	srvr := OpenAuthlessServer(c)
+	s := NewHTTPServer(srvr)
+	defer s.Close()
+
+	client := &http.Client{}
+
+	req, err := http.NewRequest("POST", s.URL+`/write`, bytes.NewBufferString("{}"))
+	if err != nil {
+		panic(err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept-Encoding", "gzip")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		panic(err)
+	}
+
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("unexpected Content-Type.  expected %q, actual: %q", "application/json", ct)
+	}
+}
+
+func TestHandler_serveWriteSeries_queryHasJsonContentType(t *testing.T) {
+	c := test.NewMessagingClient()
+	defer c.Close()
+	srvr := OpenAuthlessServer(c)
+	srvr.CreateDatabase("foo")
+	srvr.CreateRetentionPolicy("foo", influxdb.NewRetentionPolicy("bar"))
+	srvr.SetDefaultRetentionPolicy("foo", "bar")
+
+	s := NewHTTPServer(srvr)
+	defer s.Close()
+
+	status, _ := MustHTTP("POST", s.URL+`/write`, nil, nil, `{"database" : "foo", "retentionPolicy" : "bar", "points": [{"name": "cpu", "tags": {"host": "server01"},"timestamp": "2009-11-10T23:00:00Z", "fields": {"value": 100}}]}`)
+	if status != http.StatusOK {
+		t.Fatalf("unexpected status: %d", status)
+	}
+	time.Sleep(100 * time.Millisecond) // Ensure data node picks up write.
+
+	srvr.Restart() // Ensure data is queryable across restarts.
+
+	client := &http.Client{}
+
+	params := url.Values{}
+	params.Add("db", "foo")
+	params.Add("q", "select * from cpu")
+	req, err := http.NewRequest("GET", s.URL+`/query?`+params.Encode(), bytes.NewBufferString(""))
+	if err != nil {
+		panic(err)
+	}
+
+	req.Header.Set("Accept-Encoding", "gzip")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		panic(err)
+	}
+
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("unexpected Content-Type.  expected %q, actual: %q", "application/json", ct)
+	}
+
+	// now test a query error
+	params.Del("db")
+
+	req_error, err := http.NewRequest("GET", s.URL+`/query?`+params.Encode(), bytes.NewBufferString(""))
+	if err != nil {
+		panic(err)
+	}
+
+	req_error.Header.Set("Accept-Encoding", "gzip")
+
+	resp_error, err := client.Do(req_error)
+	if err != nil {
+		panic(err)
+	}
+
+	if cte := resp_error.Header.Get("Content-Type"); cte != "application/json" {
+		t.Fatalf("unexpected Content-Type.  expected %q, actual: %q", "application/json", cte)
 	}
 }
 
@@ -1469,6 +1566,55 @@ func TestHandler_ProcessContinousQueries(t *testing.T) {
 	}
 }
 
+// Ensure the snapshot handler can write a snapshot as a tar archive over HTTP.
+func TestSnapshotHandler(t *testing.T) {
+	// Create handler and mock the snapshot creator.
+	var h httpd.SnapshotHandler
+	h.CreateSnapshotWriter = func() (*influxdb.SnapshotWriter, error) {
+		return &influxdb.SnapshotWriter{
+			Snapshot: &influxdb.Snapshot{
+				Files: []influxdb.SnapshotFile{
+					{Name: "meta", Size: 5, Index: 12},
+					{Name: "shards/1", Size: 6, Index: 15},
+				},
+			},
+			FileWriters: map[string]influxdb.SnapshotFileWriter{
+				"meta":     influxdb.NopWriteToCloser(bytes.NewBufferString("55555")),
+				"shards/1": influxdb.NopWriteToCloser(bytes.NewBufferString("666666")),
+			},
+		}, nil
+	}
+
+	// Execute handler with an existing snapshot to diff.
+	// The "shards/1" has a higher index in the diff so it won't be included in the snapshot.
+	w := httptest.NewRecorder()
+	r, _ := http.NewRequest(
+		"GET", "http://localhost/snapshot",
+		strings.NewReader(`{"files":[{"name":"meta","index":10},{"name":"shards/1","index":20}]}`),
+	)
+	h.ServeHTTP(w, r)
+
+	// Verify status code is successful and the snapshot was written.
+	if w.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", w.Code)
+	} else if w.Body == nil {
+		t.Fatal("body not written")
+	}
+
+	// Read snapshot.
+	tr := tar.NewReader(w.Body)
+	if hdr, err := tr.Next(); err != nil {
+		t.Fatal(err)
+	} else if hdr.Name != "manifest" {
+		t.Fatalf("unexpected snapshot file: %s", hdr.Name)
+	}
+	if b, err := ioutil.ReadAll(tr); err != nil {
+		t.Fatal(err)
+	} else if string(b) != `{"files":[{"name":"meta","size":5,"index":12}]}` {
+		t.Fatalf("unexpected manifest: %s", b)
+	}
+}
+
 // batchWrite JSON Unmarshal tests
 
 // Utility functions for this test suite.
@@ -1501,6 +1647,7 @@ func MustHTTP(verb, path string, params, headers map[string]string, body string)
 
 	b, err := ioutil.ReadAll(resp.Body)
 	return resp.StatusCode, strings.TrimRight(string(b), "\n")
+
 }
 
 // MustParseURL parses a string into a URL. Panic on error.
@@ -1539,7 +1686,9 @@ type Server struct {
 
 // NewServer returns a new test server instance.
 func NewServer() *Server {
-	return &Server{influxdb.NewServer()}
+	s := &Server{influxdb.NewServer()}
+	s.RetentionAutoCreate = true
+	return s
 }
 
 // OpenAuthenticatedServer returns a new, open test server instance with authentication enabled.

@@ -3,7 +3,7 @@ package graphite
 import (
 	"errors"
 	"fmt"
-	"io"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -38,7 +38,6 @@ type SeriesWriter interface {
 
 // Server defines the interface all Graphite servers support.
 type Server interface {
-	SetLogOutput(w io.Writer)
 	ListenAndServe(iface string) error
 }
 
@@ -89,12 +88,13 @@ func (p *Parser) Parse(line string) (influxdb.Point, error) {
 	fieldValues[name] = v
 
 	// Parse timestamp.
-	unixTime, err := strconv.ParseInt(fields[2], 10, 64)
+	unixTime, err := strconv.ParseFloat(fields[2], 64)
 	if err != nil {
 		return influxdb.Point{}, err
 	}
 
-	timestamp := time.Unix(0, unixTime*int64(time.Millisecond))
+	// Check if we have fractional seconds
+	timestamp := time.Unix(int64(unixTime), int64((unixTime-math.Floor(unixTime))*float64(time.Second)))
 
 	point := influxdb.Point{
 		Name:      name,

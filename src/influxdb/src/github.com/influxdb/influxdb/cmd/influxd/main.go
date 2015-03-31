@@ -4,11 +4,13 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"os/signal"
 	"runtime"
 	"runtime/pprof"
 	"strings"
+	"time"
 )
 
 const logo = `
@@ -36,11 +38,18 @@ const (
 
 func main() {
 	log.SetFlags(0)
+	log.SetPrefix(`[srvr] `)
+	log.SetFlags(log.LstdFlags)
+	rand.Seed(time.Now().UnixNano())
 
 	// If commit not set, make that clear.
 	if commit == "" {
 		commit = "unknown"
 	}
+
+	// Set parallelism.
+	runtime.GOMAXPROCS(runtime.NumCPU())
+	log.Printf("GOMAXPROCS set to %d", runtime.GOMAXPROCS(0))
 
 	// Shift binary name off argument list.
 	args := os.Args[1:]
@@ -68,6 +77,16 @@ func main() {
 		execRun(args[1:])
 	case "":
 		execRun(args)
+	case "backup":
+		cmd := NewBackupCommand()
+		if err := cmd.Run(args[1:]...); err != nil {
+			log.Fatalf("backup: %s", err)
+		}
+	case "restore":
+		cmd := NewRestoreCommand()
+		if err := cmd.Run(args[1:]...); err != nil {
+			log.Fatalf("restore: %s", err)
+		}
 	case "version":
 		execVersion(args[1:])
 	case "config":
@@ -99,28 +118,18 @@ func execRun(args []string) {
 	defer stopProfiling()
 
 	// Print sweet InfluxDB logo and write the process id to file.
-	log.Print(logo)
-	log.SetPrefix(`[srvr] `)
-	log.SetFlags(log.LstdFlags)
+	fmt.Print(logo)
 	writePIDFile(*pidPath)
 
-	if *configPath == "" {
+	// Parse configuration file from disk.
+	config, err := parseConfig(*configPath, *hostname)
+	if err != nil {
+		log.Fatal(err)
+	} else if *configPath == "" {
 		log.Println("No config provided, using default settings")
 	}
-	config := parseConfig(*configPath, *hostname)
 
-	// Create a logging writer.
-	logWriter := os.Stderr
-	if config.Logging.File != "" {
-		var err error
-		logWriter, err = os.OpenFile(config.Logging.File, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0660)
-		if err != nil {
-			log.Fatalf("unable to open log file %s: %s", config.Logging.File, err.Error())
-		}
-	}
-	log.SetOutput(logWriter)
-
-	Run(config, *join, version, logWriter)
+	Run(config, *join, version)
 
 	// Wait indefinitely.
 	<-(chan struct{})(nil)
@@ -149,13 +158,23 @@ func execVersion(args []string) {
 func execConfig(args []string) {
 	// Parse command flags.
 	fs := flag.NewFlagSet("", flag.ExitOnError)
+	fs.Usage = func() {
+		log.Println(`usage: config
+
+	config displays the default configiguration
+						    `)
+	}
+
 	var (
 		configPath = fs.String("config", "", "")
 		hostname   = fs.String("hostname", "", "")
 	)
 	fs.Parse(args)
 
-	config := parseConfig(*configPath, *hostname)
+	config, err := parseConfig(*configPath, *hostname)
+	if err != nil {
+		log.Fatalf("parse config: %s", err)
+	}
 
 	config.Write(os.Stdout)
 }
@@ -171,6 +190,7 @@ Usage:
 
 The commands are:
 
+    config               display the default configuration
     join-cluster         create a new node that will join an existing cluster
     run                  run node with existing configuration
     version              displays the InfluxDB version
@@ -232,3 +252,6 @@ func stopProfiling() {
 		prof.mem.Close()
 	}
 }
+
+func warn(v ...interface{})              { fmt.Fprintln(os.Stderr, v...) }
+func warnf(msg string, v ...interface{}) { fmt.Fprintf(os.Stderr, msg+"\n", v...) }

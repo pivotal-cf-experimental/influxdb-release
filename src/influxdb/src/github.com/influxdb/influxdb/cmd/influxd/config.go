@@ -38,6 +38,12 @@ const (
 	// DefaultDataPort represents the default port the data server runs on.
 	DefaultDataPort = 8086
 
+	// DefaultSnapshotBindAddress is the default bind address to serve snapshots from.
+	DefaultSnapshotBindAddress = "127.0.0.1"
+
+	// DefaultSnapshotPort is the default port to serve snapshots from.
+	DefaultSnapshotPort = 8087
+
 	// DefaultJoinURLs represents the default URLs for joining a cluster.
 	DefaultJoinURLs = ""
 
@@ -48,6 +54,11 @@ const (
 	// DefaultGraphiteDatabaseName is the default Graphite database if none is specified
 	DefaultGraphiteDatabaseName = "graphite"
 )
+
+var DefaultSnapshotURL = url.URL{
+	Scheme: "http",
+	Host:   net.JoinHostPort(DefaultSnapshotBindAddress, strconv.Itoa(DefaultSnapshotPort)),
+}
 
 // Config represents the configuration format for the influxd binary.
 type Config struct {
@@ -101,14 +112,18 @@ type Config struct {
 		RetentionCreatePeriod Duration `toml:"retention-create-period"`
 	} `toml:"data"`
 
+	Snapshot struct {
+		Enabled     bool   `toml:"enabled"`
+		BindAddress string `toml:"bind-address"`
+		Port        int    `toml:"port"`
+	}
 	Cluster struct {
 		Dir string `toml:"dir"`
 	} `toml:"cluster"`
 
 	Logging struct {
-		File         string `toml:"file"`
-		WriteTracing bool   `toml:"write-tracing"`
-		RaftTracing  bool   `toml:"raft-tracing"`
+		WriteTracing bool `toml:"write-tracing"`
+		RaftTracing  bool `toml:"raft-tracing"`
 	} `toml:"logging"`
 
 	Statistics struct {
@@ -152,8 +167,11 @@ type Config struct {
 }
 
 // NewConfig returns an instance of Config with reasonable defaults.
-func NewConfig() *Config {
-	u, _ := user.Current()
+func NewConfig() (*Config, error) {
+	u, err := user.Current()
+	if err != nil {
+		return nil, fmt.Errorf("failed to determine current user for storage")
+	}
 
 	c := &Config{}
 	c.Broker.Dir = filepath.Join(u.HomeDir, ".influxdb/broker")
@@ -165,6 +183,9 @@ func NewConfig() *Config {
 	c.Data.RetentionCheckEnabled = true
 	c.Data.RetentionCheckPeriod = Duration(10 * time.Minute)
 	c.Data.RetentionCreatePeriod = Duration(DefaultRetentionCreatePeriod)
+	c.Snapshot.Enabled = true
+	c.Snapshot.BindAddress = DefaultSnapshotBindAddress
+	c.Snapshot.Port = DefaultSnapshotPort
 	c.Admin.Enabled = true
 	c.Admin.Port = 8083
 	c.ContinuousQuery.RecomputePreviousN = 2
@@ -191,7 +212,7 @@ func NewConfig() *Config {
 	// 	Port:     tomlConfiguration.InputPlugins.UDPInput.Port,
 	// })
 
-	return c
+	return c, nil
 }
 
 // DataAddr returns the TCP binding address for the data server.
@@ -210,6 +231,11 @@ func (c *Config) DataURL() url.URL {
 		Scheme: "http",
 		Host:   net.JoinHostPort(c.Hostname, strconv.Itoa(c.Data.Port)),
 	}
+}
+
+// SnapshotAddr returns the TCP binding address for the snapshot handler.
+func (c *Config) SnapshotAddr() string {
+	return net.JoinHostPort(c.Snapshot.BindAddress, strconv.Itoa(c.Snapshot.Port))
 }
 
 // BrokerAddr returns the binding address the Broker server
@@ -320,7 +346,10 @@ func (d *Duration) UnmarshalText(text []byte) error {
 
 // ParseConfigFile parses a configuration file at a given path.
 func ParseConfigFile(path string) (*Config, error) {
-	c := NewConfig()
+	c, err := NewConfig()
+	if err != nil {
+		return nil, err
+	}
 	if _, err := toml.DecodeFile(path, &c); err != nil {
 		return nil, err
 	}
@@ -329,7 +358,10 @@ func ParseConfigFile(path string) (*Config, error) {
 
 // ParseConfig parses a configuration string into a config object.
 func ParseConfig(s string) (*Config, error) {
-	c := NewConfig()
+	c, err := NewConfig()
+	if err != nil {
+		return nil, err
+	}
 	if _, err := toml.Decode(s, &c); err != nil {
 		return nil, err
 	}

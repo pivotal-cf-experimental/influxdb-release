@@ -313,7 +313,7 @@ func (m *Measurement) tagSets(stmt *influxql.SelectStatement, dimensions []strin
 	filters := m.filters(stmt)
 
 	// build the tag sets
-	tagStrings := make([]string, 0)
+	var tagStrings []string
 	tagSets := make(map[string]*influxql.TagSet)
 	for id, filter := range filters {
 		// get the series and set the tag values for the dimensions we care about
@@ -404,15 +404,16 @@ func (m *Measurement) idsForExpr(n *influxql.BinaryExpr) (seriesIDs, bool, influ
 func (m *Measurement) walkWhereForSeriesIds(expr influxql.Expr, filters map[uint32]influxql.Expr) (seriesIDs, bool, influxql.Expr) {
 	switch n := expr.(type) {
 	case *influxql.BinaryExpr:
-		// if it's EQ then it's either a field expression or against a tag. we can return this
-		if n.Op == influxql.EQ || n.Op == influxql.LT || n.Op == influxql.LTE || n.Op == influxql.GT ||
-			n.Op == influxql.GTE || n.Op == influxql.EQREGEX || n.Op == influxql.NEQREGEX {
+		switch n.Op {
+		case influxql.EQ, influxql.NEQ, influxql.LT, influxql.LTE, influxql.GT, influxql.GTE, influxql.EQREGEX, influxql.NEQREGEX:
+			// if it's a compare, then it's either a field expression or against a tag. we can return this
 			ids, shouldInclude, expr := m.idsForExpr(n)
 			for _, id := range ids {
 				filters[id] = expr
 			}
 			return ids, shouldInclude, expr
-		} else if n.Op == influxql.AND || n.Op == influxql.OR { // if it's an AND or OR we need to union or intersect the results
+		case influxql.AND, influxql.OR:
+			// if it's an AND or OR we need to union or intersect the results
 			var ids seriesIDs
 			l, il, lexpr := m.walkWhereForSeriesIds(n.LHS, filters)
 			r, ir, rexpr := m.walkWhereForSeriesIds(n.RHS, filters)
@@ -1073,6 +1074,13 @@ type RetentionPolicy struct {
 	shardGroups []*ShardGroup
 }
 
+// RetentionPolicies represents a list of retention policies.
+type RetentionPolicies []*RetentionPolicy
+
+func (a RetentionPolicies) Len() int           { return len(a) }
+func (a RetentionPolicies) Less(i, j int) bool { return a[i].Name < a[j].Name }
+func (a RetentionPolicies) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+
 // NewRetentionPolicy returns a new instance of RetentionPolicy with defaults set.
 func NewRetentionPolicy(name string) *RetentionPolicy {
 	return &RetentionPolicy{
@@ -1128,10 +1136,8 @@ func (db *database) dropMeasurement(name string) error {
 
 	// remove series data from shards
 	for _, rp := range db.policies {
-		for _, id := range ids {
-			if err := rp.dropSeries(id); err != nil {
-				return err
-			}
+		if err := rp.dropSeries(ids...); err != nil {
+			return err
 		}
 	}
 
@@ -1139,9 +1145,9 @@ func (db *database) dropMeasurement(name string) error {
 }
 
 // dropSeries will delete all data with the seriesID
-func (rp *RetentionPolicy) dropSeries(seriesID uint32) error {
+func (rp *RetentionPolicy) dropSeries(seriesIDs ...uint32) error {
 	for _, g := range rp.shardGroups {
-		err := g.dropSeries(seriesID)
+		err := g.dropSeries(seriesIDs...)
 		if err != nil {
 			return err
 		}
@@ -1436,6 +1442,17 @@ func (db *database) measurementsByTagFilters(filters []*TagFilter) Measurements 
 	}
 
 	return measurements
+}
+
+// measurementsByRegex returns the measurements that match the regex.
+func (db *database) measurementsByRegex(re *regexp.Regexp) Measurements {
+	var matches Measurements
+	for _, m := range db.measurements {
+		if re.MatchString(m.Name) {
+			matches = append(matches, m)
+		}
+	}
+	return matches
 }
 
 // Measurements returns a list of all measurements.

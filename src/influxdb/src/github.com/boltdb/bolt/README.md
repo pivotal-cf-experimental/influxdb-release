@@ -125,6 +125,48 @@ no mutating operations are allowed within a read-only transaction. You can only
 retrieve buckets, retrieve values, and copy the database within a read-only
 transaction.
 
+
+#### Batch read-write transactions
+
+Each `DB.Update()` waits for disk to commit the writes. This overhead
+can be minimized by combining multiple updates with the `DB.Batch()`
+function:
+
+```go
+err := db.Batch(func(tx *bolt.Tx) error {
+	...
+	return nil
+})
+```
+
+Concurrent Batch calls are opportunistically combined into larger
+transactions. Batch is only useful when there are multiple goroutines
+calling it.
+
+The trade-off is that `Batch` can call the given
+function multiple times, if parts of the transaction fail. The
+function must be idempotent and side effects must take effect only
+after a successful return from `DB.Batch()`.
+
+For example: don't display messages from inside the function, instead
+set variables in the enclosing scope:
+
+```go
+var id uint64
+err := db.Batch(func(tx *bolt.Tx) error {
+	// Find last key in bucket, decode as bigendian uint64, increment
+	// by one, encode back to []byte, and add new key.
+	...
+	id = newValue
+	return nil
+})
+if err != nil {
+	return ...
+}
+fmt.Println("Allocated ID %d", id)
+```
+
+
 #### Managing transactions manually
 
 The `DB.View()` and `DB.Update()` functions are wrappers around the `DB.Begin()`
@@ -215,6 +257,10 @@ will return `nil`. It's important to note that you can have a zero-length value
 set to a key which is different than the key not existing.
 
 Use the `Bucket.Delete()` function to delete a key from the bucket.
+
+Please note that values returned from `Get()` are only valid while the
+transaction is open. If you need to use a value outside of the transaction
+then you must use `copy()` to copy it to another byte slice.
 
 
 ### Iterating over keys
@@ -328,7 +374,7 @@ func (*Bucket) DeleteBucket(key []byte) error
 
 ### Database backups
 
-Bolt is a single file so it's easy to backup. You can use the `Tx.Copy()`
+Bolt is a single file so it's easy to backup. You can use the `Tx.WriteTo()`
 function to write a consistent view of the database to a writer. If you call
 this from a read-only transaction, it will perform a hot backup and not block
 your other database reads and writes. It will also use `O_DIRECT` when available
@@ -339,11 +385,12 @@ do database backups:
 
 ```go
 func BackupHandleFunc(w http.ResponseWriter, req *http.Request) {
-	err := db.View(func(tx bolt.Tx) error {
+	err := db.View(func(tx *bolt.Tx) error {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Disposition", `attachment; filename="my.db"`)
 		w.Header().Set("Content-Length", strconv.Itoa(int(tx.Size())))
-		return tx.Copy(w)
+		_, err := tx.WriteTo(w)
+		return err
 	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -503,6 +550,17 @@ Here are a few things to note when evaluating and using Bolt:
   However, this is expected and the OS will release memory as needed. Bolt can
   handle databases much larger than the available physical RAM.
 
+* Because of the way pages are laid out on disk, Bolt cannot truncate data files
+  and return free pages back to the disk. Instead, Bolt maintains a free list
+  of unused pages within its data file. These free pages can be reused by later
+  transactions. This works well for many use cases as databases generally tend
+  to grow. However, it's important to note that deleting large chunks of data
+  will not allow you to reclaim that space on disk.
+
+  For more information on page allocation, [see this comment][page-allocation].
+
+[page-allocation]: https://github.com/boltdb/bolt/issues/308#issuecomment-74811638
+
 
 ## Other Projects Using Bolt
 
@@ -527,5 +585,6 @@ Below is a list of public, open source projects that use Bolt:
 * [bleve](http://www.blevesearch.com/) - A pure Go search engine similar to ElasticSearch that uses Bolt as the default storage backend.
 * [tentacool](https://github.com/optiflows/tentacool) - REST api server to manage system stuff (IP, DNS, Gateway...) on a linux server.
 * [SkyDB](https://github.com/skydb/sky) - Behavioral analytics database.
+* [Seaweed File System](https://github.com/chrislusf/weed-fs) - Highly scalable distributed key~file system with O(1) disk read.
 
 If you are using Bolt in a project please send a pull request to add it to the list.

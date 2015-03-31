@@ -45,9 +45,9 @@ func (g *ShardGroup) Contains(min, max time.Time) bool {
 }
 
 // dropSeries will delete all data with the seriesID
-func (g *ShardGroup) dropSeries(seriesID uint32) error {
+func (g *ShardGroup) dropSeries(seriesIDs ...uint32) error {
 	for _, s := range g.Shards {
-		err := s.dropSeries(seriesID)
+		err := s.dropSeries(seriesIDs...)
 		if err != nil {
 			return err
 		}
@@ -62,9 +62,12 @@ type Shard struct {
 	ID          uint64   `json:"id,omitempty"`
 	DataNodeIDs []uint64 `json:"nodeIDs,omitempty"` // owners
 
+	mu    sync.RWMutex
 	index uint64        // highest replicated index
 	store *bolt.DB      // underlying data store
 	conn  MessagingConn // streaming connection to broker
+
+	stats *Stats // In-memory stats
 
 	wg      sync.WaitGroup // pending goroutines
 	closing chan struct{}  // close notification
@@ -75,9 +78,16 @@ func newShard() *Shard { return &Shard{} }
 
 // open initializes and opens the shard's store.
 func (s *Shard) open(path string, conn MessagingConn) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	// Return an error if the shard is already open.
 	if s.store != nil {
 		return errors.New("shard already open")
+	}
+
+	if s.stats == nil {
+		s.stats = NewStats("shard")
 	}
 
 	// Open store on shard.
@@ -88,15 +98,12 @@ func (s *Shard) open(path string, conn MessagingConn) error {
 	s.store = store
 
 	// Initialize store.
-	s.index = 0
 	if err := s.store.Update(func(tx *bolt.Tx) error {
+		_, _ = tx.CreateBucketIfNotExists([]byte("meta"))
 		_, _ = tx.CreateBucketIfNotExists([]byte("values"))
 
 		// Find highest replicated index.
-		b, _ := tx.CreateBucketIfNotExists([]byte("meta"))
-		if buf := b.Get([]byte("index")); len(buf) > 0 {
-			s.index = btou64(buf)
-		}
+		s.index = shardMetaIndex(tx)
 
 		// Open connection.
 		if err := conn.Open(s.index, true); err != nil {
@@ -117,6 +124,15 @@ func (s *Shard) open(path string, conn MessagingConn) error {
 	return nil
 }
 
+// shardMetaIndex returns the index from the "meta" bucket on a transaction.
+func shardMetaIndex(tx *bolt.Tx) uint64 {
+	var index uint64
+	if buf := tx.Bucket([]byte("meta")).Get([]byte("index")); len(buf) > 0 {
+		index = btou64(buf)
+	}
+	return index
+}
+
 // close shuts down the shard's store.
 func (s *Shard) close() error {
 	// Wait for goroutines to stop.
@@ -131,6 +147,22 @@ func (s *Shard) close() error {
 		_ = s.store.Close()
 	}
 	return nil
+}
+
+// sync returns after a given index has been reached.
+func (s *Shard) sync(index uint64) error {
+	for {
+		// Check if index has occurred.
+		s.mu.RLock()
+		i := s.index
+		s.mu.RUnlock()
+		if i >= index {
+			return nil
+		}
+
+		// Otherwise wait momentarily and check again.
+		time.Sleep(1 * time.Millisecond)
+	}
 }
 
 // HasDataNodeID return true if the data node owns the shard.
@@ -184,6 +216,8 @@ func (s *Shard) writeSeries(index uint64, batch []byte) error {
 			if err := b.Put(u64tob(uint64(timestamp)), data); err != nil {
 				return err
 			}
+			s.stats.Add("shardBytes", int64(len(data))+8) // Payload plus timestamp
+			s.stats.Inc("shardWrite")
 
 			// Push the buffer forward and check if we're done.
 			batch = batch[payloadLength:]
@@ -201,14 +235,16 @@ func (s *Shard) writeSeries(index uint64, batch []byte) error {
 	})
 }
 
-func (s *Shard) dropSeries(seriesID uint32) error {
+func (s *Shard) dropSeries(seriesIDs ...uint32) error {
 	if s.store == nil {
 		return nil
 	}
 	return s.store.Update(func(tx *bolt.Tx) error {
-		err := tx.DeleteBucket(u32tob(seriesID))
-		if err != bolt.ErrBucketNotFound {
-			return err
+		for _, seriesID := range seriesIDs {
+			err := tx.DeleteBucket(u32tob(seriesID))
+			if err != bolt.ErrBucketNotFound {
+				return err
+			}
 		}
 		return nil
 	})
@@ -233,13 +269,17 @@ func (s *Shard) processor(conn MessagingConn, closing <-chan struct{}) {
 		}
 
 		// Ignore any writes that are from an old index.
-		if m.Index < s.index {
+		s.mu.RLock()
+		i := s.index
+		s.mu.RUnlock()
+		if m.Index < i {
 			continue
 		}
 
 		// Handle write series separately so we don't lock server during shard writes.
 		switch m.Type {
 		case writeRawSeriesMessageType:
+			s.stats.Inc("writeSeriesMessageRx")
 			if err := s.writeSeries(m.Index, m.Data); err != nil {
 				panic(fmt.Errorf("apply shard: id=%d, idx=%d, err=%s", s.ID, m.Index, err))
 			}
@@ -248,7 +288,9 @@ func (s *Shard) processor(conn MessagingConn, closing <-chan struct{}) {
 		}
 
 		// Track last index.
+		s.mu.Lock()
 		s.index = m.Index
+		s.mu.Unlock()
 	}
 }
 

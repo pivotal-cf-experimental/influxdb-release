@@ -50,8 +50,8 @@ type Broker struct {
 func NewBroker() *Broker {
 	b := &Broker{
 		topics: make(map[uint64]*Topic),
+		Logger: log.New(os.Stderr, "[broker] ", log.LstdFlags),
 	}
-	b.SetLogOutput(os.Stderr)
 	return b
 }
 
@@ -110,17 +110,14 @@ func (b *Broker) Topic(id uint64) *Topic {
 
 // Index returns the highest index seen by the broker across all topics.
 // Returns 0 if the broker is closed.
-func (b *Broker) Index() (uint64, error) {
+func (b *Broker) Index() uint64 {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	return b.index, nil
+	return b.index
 }
 
 // opened returns true if the broker is in an open and running state.
 func (b *Broker) opened() bool { return b.path != "" }
-
-// SetLogOutput sets writer for all Broker log output.
-func (b *Broker) SetLogOutput(w io.Writer) { b.Logger = log.New(w, "[broker] ", log.LstdFlags) }
 
 // Open initializes the log.
 // The broker then must be initialized or join a cluster before it can be used.
@@ -259,8 +256,8 @@ func (b *Broker) setMaxIndex(index uint64) error {
 	return nil
 }
 
-// Snapshot streams the current state of the broker and returns the index.
-func (b *Broker) Snapshot(w io.Writer) (uint64, error) {
+// WriteTo writes a snapshot of the broker to w.
+func (b *Broker) WriteTo(w io.Writer) (int64, error) {
 	// TODO: Prevent truncation during snapshot.
 
 	// Calculate header under lock.
@@ -294,8 +291,7 @@ func (b *Broker) Snapshot(w io.Writer) (uint64, error) {
 		}
 	}
 
-	// Return the snapshot and its last applied index.
-	return hdr.Index, nil
+	return 0, nil
 }
 
 // createSnapshotHeader creates a snapshot header.
@@ -355,32 +351,32 @@ func copyFileN(w io.Writer, path string, n int64) (int64, error) {
 	return io.CopyN(w, f, n)
 }
 
-// Restore reads the broker state.
-func (b *Broker) Restore(r io.Reader) error {
+// ReadFrom reads a broker snapshot from r.
+func (b *Broker) ReadFrom(r io.Reader) (int64, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	// Remove and recreate broker path.
 	if err := b.reset(); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("reset: %s", err)
+		return 0, fmt.Errorf("reset: %s", err)
 	} else if err = os.MkdirAll(b.path, 0777); err != nil {
-		return fmt.Errorf("mkdir: %s", err)
+		return 0, fmt.Errorf("mkdir: %s", err)
 	}
 
 	// Read header frame.
 	var sz uint32
 	if err := binary.Read(r, binary.BigEndian, &sz); err != nil {
-		return fmt.Errorf("read header size: %s", err)
+		return 0, fmt.Errorf("read header size: %s", err)
 	}
 	buf := make([]byte, sz)
 	if _, err := io.ReadFull(r, buf); err != nil {
-		return fmt.Errorf("read header: %s", err)
+		return 0, fmt.Errorf("read header: %s", err)
 	}
 
 	// Decode header.
 	sh := &snapshotHeader{}
 	if err := json.Unmarshal(buf, &sh); err != nil {
-		return fmt.Errorf("decode header: %s", err)
+		return 0, fmt.Errorf("decode header: %s", err)
 	}
 
 	// Close any topics which might be open and clear them out.
@@ -392,7 +388,7 @@ func (b *Broker) Restore(r io.Reader) error {
 
 		// Create topic directory.
 		if err := os.MkdirAll(t.Path(), 0777); err != nil {
-			return fmt.Errorf("make topic dir: %s", err)
+			return 0, fmt.Errorf("make topic dir: %s", err)
 		}
 
 		// Copy data from snapshot into segment files.
@@ -414,24 +410,24 @@ func (b *Broker) Restore(r io.Reader) error {
 
 				return nil
 			}(); err != nil {
-				return err
+				return 0, err
 			}
 		}
 
 		// Open topic.
 		if err := t.Open(); err != nil {
-			return fmt.Errorf("open topic: %s", err)
+			return 0, fmt.Errorf("open topic: %s", err)
 		}
 		b.topics[t.id] = t
 	}
 
 	// Set the highest seen index.
 	if err := b.setMaxIndex(sh.Index); err != nil {
-		return fmt.Errorf("set max index: %s", err)
+		return 0, fmt.Errorf("set max index: %s", err)
 	}
 	b.index = sh.Index
 
-	return nil
+	return 0, nil
 }
 
 // reset removes all files in the broker directory besides the raft directory.
@@ -573,20 +569,21 @@ type snapshotTopicSegment struct {
 // It will panic for any errors that occur during Apply.
 type RaftFSM struct {
 	Broker interface {
+		io.WriterTo
+		io.ReaderFrom
+
 		Apply(m *Message) error
-		Index() (uint64, error)
+		Index() uint64
 		SetMaxIndex(uint64) error
-		Snapshot(w io.Writer) (uint64, error)
-		Restore(r io.Reader) error
 	}
 }
 
-func (fsm *RaftFSM) Index() (uint64, error)               { return fsm.Broker.Index() }
-func (fsm *RaftFSM) Snapshot(w io.Writer) (uint64, error) { return fsm.Broker.Snapshot(w) }
-func (fsm *RaftFSM) Restore(r io.Reader) error            { return fsm.Broker.Restore(r) }
+func (fsm *RaftFSM) Index() uint64                             { return fsm.Broker.Index() }
+func (fsm *RaftFSM) WriteTo(w io.Writer) (n int64, err error)  { return fsm.Broker.WriteTo(w) }
+func (fsm *RaftFSM) ReadFrom(r io.Reader) (n int64, err error) { return fsm.Broker.ReadFrom(r) }
 
-// MustApply applies a raft command to the broker. Panic on error.
-func (fsm *RaftFSM) MustApply(e *raft.LogEntry) {
+// Apply applies a raft command to the broker.
+func (fsm *RaftFSM) Apply(e *raft.LogEntry) error {
 	switch e.Type {
 	case raft.LogEntryCommand:
 		// Decode message.
@@ -598,15 +595,17 @@ func (fsm *RaftFSM) MustApply(e *raft.LogEntry) {
 
 		// Apply message.
 		if err := fsm.Broker.Apply(m); err != nil {
-			panic(err.Error())
+			return fmt.Errorf("broker apply: %s", err)
 		}
 
 	default:
 		// Move internal index forward if it's an internal raft comand.
 		if err := fsm.Broker.SetMaxIndex(e.Index); err != nil {
-			panic(fmt.Sprintf("set max index: idx=%d, err=%s", e.Index, err))
+			return fmt.Errorf("set max index: idx=%d, err=%s", e.Index, err)
 		}
 	}
+
+	return nil
 }
 
 // DefaultMaxSegmentSize is the largest a segment can get before starting a new segment.
@@ -928,7 +927,7 @@ func ReadSegmentByIndex(path string, index uint64) (*Segment, error) {
 	} else if index == 0 {
 		return segments[0], nil
 	} else if index < segments[0].Index {
-		return nil, ErrSegmentReclaimed
+		return segments[0], nil
 	}
 
 	// Find segment that contains index.

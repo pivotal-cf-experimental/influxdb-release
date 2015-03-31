@@ -1,6 +1,7 @@
 package httpd
 
 import (
+	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,14 +17,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"compress/gzip"
-
-	"code.google.com/p/go-uuid/uuid"
-
 	"github.com/bmizerany/pat"
 	"github.com/influxdb/influxdb"
 	"github.com/influxdb/influxdb/client"
 	"github.com/influxdb/influxdb/influxql"
+	"github.com/influxdb/influxdb/uuid"
 )
 
 // TODO: Standard response headers (see: HeaderHandler)
@@ -113,6 +111,10 @@ func NewHandler(s *influxdb.Server, requireAuthentication bool, version string) 
 			"index", // Index.
 			"GET", "/", true, true, h.serveIndex,
 		},
+		route{
+			"dump", // export all points in the given db.
+			"GET", "/dump", true, true, h.serveDump,
+		},
 	)
 
 	for _, r := range h.routes {
@@ -142,11 +144,6 @@ func NewHandler(s *influxdb.Server, requireAuthentication bool, version string) 
 	}
 
 	return h
-}
-
-// SetLogOutput sets writer for all handler log output.
-func (h *Handler) SetLogOutput(w io.Writer) {
-	h.Logger = log.New(w, "[http] ", log.LstdFlags)
 }
 
 // ServeHTTP responds to HTTP request to the handler.
@@ -183,6 +180,132 @@ func (h *Handler) serveQuery(w http.ResponseWriter, r *http.Request, user *influ
 	httpResults(w, results, pretty)
 }
 
+func interfaceToString(v interface{}) string {
+	switch t := v.(type) {
+	case nil:
+		return ""
+	case bool:
+		return fmt.Sprintf("%v", v)
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, uintptr:
+		return fmt.Sprintf("%d", t)
+	case float32, float64:
+		return fmt.Sprintf("%v", t)
+	default:
+		return fmt.Sprintf("%v", t)
+	}
+}
+
+type Point struct {
+	Name      string                 `json:"name"`
+	Timestamp time.Time              `json:"timestamp"`
+	Tags      map[string]string      `json:"tags"`
+	Fields    map[string]interface{} `json:"fields"`
+}
+
+type Batch struct {
+	Database        string  `json:"database"`
+	RetentionPolicy string  `json:"retentionPolicy"`
+	Points          []Point `json:"points"`
+}
+
+// Return all the measurements from the given DB
+func (h *Handler) showMeasurements(db string, user *influxdb.User) ([]string, error) {
+	var measurements []string
+	results := h.server.ExecuteQuery(&influxql.Query{Statements: []influxql.Statement{&influxql.ShowMeasurementsStatement{}}}, db, user)
+	if results.Err != nil {
+		return measurements, results.Err
+	}
+
+	for _, result := range results.Results {
+		for _, row := range result.Series {
+			for _, tuple := range (*row).Values {
+				for _, cell := range tuple {
+					measurements = append(measurements, interfaceToString(cell))
+				}
+			}
+		}
+	}
+	return measurements, nil
+}
+
+// serveDump returns all points in the given database as a plaintext list of JSON structs.
+// To get all points:
+// Find all measurements (show measurements).
+// For each measurement do select * from <measurement> group by *
+func (h *Handler) serveDump(w http.ResponseWriter, r *http.Request, user *influxdb.User) {
+	q := r.URL.Query()
+	db := q.Get("db")
+	pretty := q.Get("pretty") == "true"
+	delim := []byte("\n")
+	measurements, err := h.showMeasurements(db, user)
+	if err != nil {
+		httpError(w, "error with dump: "+err.Error(), pretty, http.StatusInternalServerError)
+		return
+	}
+
+	// Fetch all the points for each measurement.
+	// From the 'select' query below, we get:
+	//
+	// columns:[col1, col2, col3, ...]
+	// - and -
+	// values:[[val1, val2, val3, ...], [val1, val2, val3, ...], [val1, val2, val3, ...]...]
+	//
+	// We need to turn that into multiple rows like so...
+	// fields:{col1 : values[0][0], col2 : values[0][1], col3 : values[0][2]}
+	// fields:{col1 : values[1][0], col2 : values[1][1], col3 : values[1][2]}
+	// fields:{col1 : values[2][0], col2 : values[2][1], col3 : values[2][2]}
+	//
+	for _, measurement := range measurements {
+		queryString := fmt.Sprintf("select * from %s group by *", measurement)
+		p := influxql.NewParser(strings.NewReader(queryString))
+		query, err := p.ParseQuery()
+		if err != nil {
+			httpError(w, "error with dump: "+err.Error(), pretty, http.StatusInternalServerError)
+			return
+		}
+		//
+		results := h.server.ExecuteQuery(query, db, user)
+		for _, result := range results.Results {
+			for _, row := range result.Series {
+				points := make([]Point, 1)
+				var point Point
+				point.Name = row.Name
+				point.Tags = row.Tags
+				point.Fields = make(map[string]interface{})
+				for _, tuple := range row.Values {
+					for subscript, cell := range tuple {
+						if row.Columns[subscript] == "time" {
+							point.Timestamp, _ = cell.(time.Time)
+							continue
+						}
+						point.Fields[row.Columns[subscript]] = cell
+					}
+					points[0] = point
+					batch := &Batch{
+						Points:          points,
+						Database:        db,
+						RetentionPolicy: "default",
+					}
+					buf, err := json.Marshal(&batch)
+
+					// TODO: Make this more legit in the future
+					// Since we're streaming data as chunked responses, this error could
+					// be in the middle of an already-started data stream. Until Go 1.5,
+					// we can't really support proper trailer headers, so we'll just
+					// wait until then: https://code.google.com/p/go/issues/detail?id=7759
+					if err != nil {
+						w.Write([]byte("*** SERVER-SIDE ERROR. MISSING DATA ***"))
+						w.Write(delim)
+						return
+					}
+					w.Write(buf)
+					w.Write(delim)
+				}
+			}
+		}
+	}
+}
+
 // serveWrite receives incoming series data and writes it to the database.
 func (h *Handler) serveWrite(w http.ResponseWriter, r *http.Request, user *influxdb.User) {
 	var bp client.BatchPoints
@@ -202,8 +325,8 @@ func (h *Handler) serveWrite(w http.ResponseWriter, r *http.Request, user *influ
 	}
 
 	var writeError = func(result influxdb.Result, statusCode int) {
-		w.WriteHeader(statusCode)
 		w.Header().Add("content-type", "application/json")
+		w.WriteHeader(statusCode)
 		_ = json.NewEncoder(w).Encode(&result)
 		return
 	}
@@ -393,8 +516,8 @@ func (h *Handler) serveCreateDataNode(w http.ResponseWriter, r *http.Request) {
 	node := h.server.DataNodeByURL(u)
 
 	// Write new node back to client.
-	w.WriteHeader(http.StatusCreated)
 	w.Header().Add("content-type", "application/json")
+	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(&dataNodeJSON{ID: node.ID, URL: node.URL.String()})
 }
 
@@ -440,7 +563,8 @@ func isAuthorizationError(err error) bool {
 }
 
 func isMeasurementNotFoundError(err error) bool {
-	return (err.Error() == "measurement not found")
+	s := err.Error()
+	return strings.HasPrefix(s, "measurement") && strings.HasSuffix(s, "not found") || strings.Contains(s, "measurement not found")
 }
 
 func isFieldNotFoundError(err error) bool {
@@ -449,6 +573,8 @@ func isFieldNotFoundError(err error) bool {
 
 // httpResult writes a Results array to the client.
 func httpResults(w http.ResponseWriter, results influxdb.Results, pretty bool) {
+	w.Header().Add("content-type", "application/json")
+
 	if results.Error() != nil {
 		if isAuthorizationError(results.Error()) {
 			w.WriteHeader(http.StatusUnauthorized)
@@ -457,11 +583,10 @@ func httpResults(w http.ResponseWriter, results influxdb.Results, pretty bool) {
 		} else if isFieldNotFoundError(results.Error()) {
 			w.WriteHeader(http.StatusOK)
 		} else {
-			fmt.Println(results.Error())
 			w.WriteHeader(http.StatusInternalServerError)
 		}
 	}
-	w.Header().Add("content-type", "application/json")
+
 	var b []byte
 	if pretty {
 		b, _ = json.MarshalIndent(results, "", "    ")
@@ -610,7 +735,7 @@ func cors(inner http.Handler) http.Handler {
 
 func requestID(inner http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		uid := uuid.NewUUID()
+		uid := uuid.TimeUUID()
 		r.Header.Set("Request-Id", uid.String())
 		w.Header().Set("Request-Id", r.Header.Get("Request-Id"))
 
@@ -639,4 +764,35 @@ func recovery(inner http.Handler, name string, weblog *log.Logger) http.Handler 
 			weblog.Println(logLine)
 		}
 	})
+}
+
+// SnapshotHandler streams out a snapshot from the server.
+type SnapshotHandler struct {
+	CreateSnapshotWriter func() (*influxdb.SnapshotWriter, error)
+}
+
+func (h *SnapshotHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Read in previous snapshot from request body.
+	var prev influxdb.Snapshot
+	if err := json.NewDecoder(r.Body).Decode(&prev); err != nil && err != io.EOF {
+		httpError(w, "error reading previous snapshot: "+err.Error(), false, http.StatusBadRequest)
+		return
+	}
+
+	// Retrieve a snapshot from the server.
+	sw, err := h.CreateSnapshotWriter()
+	if err != nil {
+		httpError(w, "error creating snapshot writer: "+err.Error(), false, http.StatusInternalServerError)
+		return
+	}
+	defer sw.Close()
+
+	// Subtract existing snapshot from writer.
+	sw.Snapshot = sw.Snapshot.Diff(&prev)
+
+	// Write to response.
+	if _, err := sw.WriteTo(w); err != nil {
+		httpError(w, "error writing snapshot: "+err.Error(), false, http.StatusInternalServerError)
+		return
+	}
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"time"
@@ -145,6 +146,32 @@ func (c *Client) Ping() (time.Duration, string, error) {
 	return time.Since(now), version, nil
 }
 
+// Dump connects to server and retrieves all data stored for specified database.
+// If successful, Dump returns the entire response body, which is an io.ReadCloser
+func (c *Client) Dump(db string) (io.ReadCloser, error) {
+	u := c.url
+	u.Path = "dump"
+	values := u.Query()
+	values.Set("db", db)
+	values.Set("user", c.username)
+	values.Set("password", c.password)
+	u.RawQuery = values.Encode()
+
+	req, err := http.NewRequest("GET", u.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", c.userAgent)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return resp.Body, fmt.Errorf("HTTP Protocol error %d", resp.StatusCode)
+	}
+	return resp.Body, nil
+}
+
 // Structs
 
 // Result represents a resultset returned from a single statement.
@@ -235,13 +262,13 @@ func (r *Results) UnmarshalJSON(b []byte) error {
 
 // Error returns the first error from any statement.
 // Returns nil if no errors occurred on any statements.
-func (a Results) Error() error {
-	if a.Err != nil {
-		return a.Err
+func (r Results) Error() error {
+	if r.Err != nil {
+		return r.Err
 	}
-	for _, r := range a.Results {
-		if r.Err != nil {
-			return r.Err
+	for _, result := range r.Results {
+		if result.Err != nil {
+			return result.Err
 		}
 	}
 	return nil
@@ -268,10 +295,12 @@ func (p *Point) MarshalJSON() ([]byte, error) {
 		Tags      map[string]string      `json:"tags,omitempty"`
 		Timestamp string                 `json:"timestamp,omitempty"`
 		Fields    map[string]interface{} `json:"fields,omitempty"`
+		Precision string                 `json:"precision,omitempty"`
 	}{
-		Name:   p.Name,
-		Tags:   p.Tags,
-		Fields: p.Fields,
+		Name:      p.Name,
+		Tags:      p.Tags,
+		Fields:    p.Fields,
+		Precision: p.Precision,
 	}
 	// Let it omit empty if it's really zero
 	if !p.Timestamp.IsZero() {

@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"io"
 	"io/ioutil"
 	"log"
 	"net"
@@ -24,14 +23,8 @@ import (
 	"github.com/influxdb/influxdb/udp"
 )
 
-func Run(config *Config, join, version string, logWriter *os.File) (*messaging.Broker, *influxdb.Server) {
+func Run(config *Config, join, version string) (*messaging.Broker, *influxdb.Server) {
 	log.Printf("influxdb started, version %s, commit %s", version, commit)
-
-	// Parse the configuration and determine if a broker and/or server exist.
-	configExists := config != nil
-	if config == nil {
-		config = NewConfig()
-	}
 
 	var initBroker, initServer bool
 	if initBroker = !fileExists(config.BrokerDir()); initBroker {
@@ -52,7 +45,7 @@ func Run(config *Config, join, version string, logWriter *os.File) (*messaging.B
 	}
 
 	// Open broker & raft log, initialize or join as necessary.
-	b, l := openBroker(config.BrokerDir(), config.BrokerURL(), initBroker, joinURLs, logWriter, config.Logging.RaftTracing)
+	b, l := openBroker(config.BrokerDir(), config.BrokerURL(), initBroker, joinURLs, config.Logging.RaftTracing)
 
 	// Start the broker handler.
 	var h *Handler
@@ -86,7 +79,7 @@ func Run(config *Config, join, version string, logWriter *os.File) (*messaging.B
 	}
 
 	// Open server, initialize or join as necessary.
-	s := openServer(config, b, initServer, initBroker, configExists, joinURLs, logWriter)
+	s := openServer(config, b, initServer, initBroker, joinURLs)
 	s.SetAuthenticationEnabled(config.Authentication.Enabled)
 
 	// Enable retention policy enforcement if requested.
@@ -108,7 +101,6 @@ func Run(config *Config, join, version string, logWriter *os.File) (*messaging.B
 	// Start the server handler. Attach to broker if listening on the same port.
 	if s != nil {
 		sh := httpd.NewHandler(s, config.Authentication.Enabled, version)
-		sh.SetLogOutput(logWriter)
 		sh.WriteTrace = config.Logging.WriteTracing
 
 		if h != nil && config.BrokerAddr() == config.DataAddr() {
@@ -122,6 +114,21 @@ func Run(config *Config, join, version string, logWriter *os.File) (*messaging.B
 			go func() { log.Fatal(http.Serve(listener, sh)) }()
 		}
 		log.Printf("data node #%d listening on %s", s.ID(), config.DataAddr())
+
+		if config.Snapshot.Enabled {
+			// Start snapshot handler.
+			go func() {
+				log.Fatal(http.ListenAndServe(
+					config.SnapshotAddr(),
+					&httpd.SnapshotHandler{
+						CreateSnapshotWriter: s.CreateSnapshotWriter,
+					},
+				))
+			}()
+			log.Printf("snapshot endpoint listening on %s", config.SnapshotAddr())
+		} else {
+			log.Println("snapshot endpoint disabled")
+		}
 
 		// Start the admin interface on the default port
 		if config.Admin.Enabled {
@@ -173,7 +180,6 @@ func Run(config *Config, join, version string, logWriter *os.File) (*messaging.B
 			if err != nil {
 				log.Fatalf("failed to initialize %s Graphite server: %s", c.Protocol, err.Error())
 			}
-			g.SetLogOutput(logWriter)
 
 			err = g.ListenAndServe(c.ConnectionString(config.BindAddress))
 			if err != nil {
@@ -207,7 +213,7 @@ func Run(config *Config, join, version string, logWriter *os.File) (*messaging.B
 	if !config.ReportingDisabled {
 		// Make sure we have a config object b4 we try to use it.
 		if clusterID := b.Broker.ClusterID(); clusterID != 0 {
-			go s.StartReportingLoop(version, clusterID)
+			go s.StartReportingLoop(clusterID)
 		}
 	}
 
@@ -233,16 +239,20 @@ func writePIDFile(path string) {
 	}
 }
 
-// parses the configuration from a given path. Sets overrides as needed.
-func parseConfig(path, hostname string) *Config {
+// parseConfig parses the configuration from a given path. Sets overrides as needed.
+func parseConfig(path, hostname string) (*Config, error) {
 	if path == "" {
-		return NewConfig()
+		c, err := NewConfig()
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate default config: %s. Please supply an explicit configuration file", err.Error())
+		}
+		return c, nil
 	}
 
 	// Parse configuration.
 	config, err := ParseConfigFile(path)
 	if err != nil {
-		log.Fatalf("config: %s", err)
+		return nil, fmt.Errorf("config: %s", err)
 	}
 
 	// Override config properties.
@@ -250,26 +260,25 @@ func parseConfig(path, hostname string) *Config {
 		config.Hostname = hostname
 	}
 
-	return config
+	return config, nil
 }
 
 // creates and initializes a broker.
-func openBroker(path string, u url.URL, initializing bool, joinURLs []url.URL, w io.Writer, raftTracing bool) (*influxdb.Broker, *raft.Log) {
+func openBroker(path string, u url.URL, initializing bool, joinURLs []url.URL, raftTracing bool) (*influxdb.Broker, *raft.Log) {
 	// Create raft log.
 	l := raft.NewLog()
 	l.SetURL(u)
-	l.SetLogOutput(w)
 	l.DebugEnabled = raftTracing
 
 	// Create broker.
 	b := influxdb.NewBroker()
 	b.Log = l
-	b.SetLogOutput(w)
 
 	// Open broker so it can feed last index data to the log.
 	if err := b.Open(path); err != nil {
-		log.Fatalf("failed to open broker: %s", err)
+		log.Fatalf("failed to open broker at %s : %s", path, err)
 	}
+	log.Printf("broker opened at %s", path)
 
 	// Attach the broker as the finite state machine of the raft log.
 	l.FSM = &messaging.RaftFSM{Broker: b}
@@ -310,16 +319,15 @@ func joinLog(l *raft.Log, joinURLs []url.URL) {
 }
 
 // creates and initializes a server.
-func openServer(config *Config, b *influxdb.Broker, initServer, initBroker, configExists bool, joinURLs []url.URL, w io.Writer) *influxdb.Server {
-	// Use broker URL is there is no config and there are no join URLs passed.
+func openServer(config *Config, b *influxdb.Broker, initServer, initBroker bool, joinURLs []url.URL) *influxdb.Server {
+	// Use broker URL if there are no join URLs passed.
 	clientJoinURLs := joinURLs
-	if !configExists || len(joinURLs) == 0 {
+	if len(joinURLs) == 0 {
 		clientJoinURLs = []url.URL{b.URL()}
 	}
 
 	// Create messaging client to the brokers.
 	c := influxdb.NewMessagingClient()
-	c.SetLogOutput(w)
 	if err := c.Open(filepath.Join(config.Data.Dir, messagingClientFile)); err != nil {
 		log.Fatalf("messaging client error: %s", err)
 	}
@@ -336,18 +344,20 @@ func openServer(config *Config, b *influxdb.Broker, initServer, initBroker, conf
 
 	// Create and open the server.
 	s := influxdb.NewServer()
-	s.SetLogOutput(w)
 	s.WriteTrace = config.Logging.WriteTracing
 	s.RetentionAutoCreate = config.Data.RetentionAutoCreate
 	s.RecomputePreviousN = config.ContinuousQuery.RecomputePreviousN
 	s.RecomputeNoOlderThan = time.Duration(config.ContinuousQuery.RecomputeNoOlderThan)
 	s.ComputeRunsPerInterval = config.ContinuousQuery.ComputeRunsPerInterval
 	s.ComputeNoMoreThan = time.Duration(config.ContinuousQuery.ComputeNoMoreThan)
+	s.Version = version
+	s.CommitHash = commit
 
 	// Open server with data directory and broker client.
 	if err := s.Open(config.Data.Dir, c); err != nil {
 		log.Fatalf("failed to open data server: %v", err.Error())
 	}
+	log.Printf("data server opened at %s", config.Data.Dir)
 
 	// If the server is uninitialized then initialize or join it.
 	if initServer {

@@ -1,4 +1,68 @@
-## v0.9.0-rc13 [unreleased]
+## v0.9.0-rc18 [Unreleased]
+
+### Bugfixes
+- [#2100](https://github.com/influxdb/influxdb/pull/2100): Use channel to synchronize collectd shutdown.
+- [#2100](https://github.com/influxdb/influxdb/pull/2100): Synchronize access to shard index.
+
+## v0.9.0-rc17 [2015-03-29]
+
+### Features
+- [#2076](https://github.com/influxdb/influxdb/pull/2076): Separate stdout and stderr output in init.d script
+- [#2091](https://github.com/influxdb/influxdb/pull/2091): Support disabling snapshot endpoint.
+- [#2081](https://github.com/influxdb/influxdb/pull/2081): Support writing diagnostic data into the internal database.
+- [#2095](https://github.com/influxdb/influxdb/pull/2095): Improved InfluxDB client docs. Thanks @derailed
+
+### Bugfixes
+- [#2093](https://github.com/influxdb/influxdb/pull/2093): Point precision not marshalled correctly. Thanks @derailed
+- [#2084](https://github.com/influxdb/influxdb/pull/2084): Allowing leading underscores in identifiers.
+- [#2080](https://github.com/influxdb/influxdb/pull/2080): Graphite logs in seconds, not milliseconds.
+- [#2101](https://github.com/influxdb/influxdb/pull/2101): SHOW DATABASES should name returned series "databases".
+- [#2104](https://github.com/influxdb/influxdb/pull/2104): Include NEQ when calculating field filters.
+- [#2112](https://github.com/influxdb/influxdb/pull/2112): Set GOMAXPROCS on startup. This may have been causing extra leader elections, which would cause a number of other bugs or instability.
+- [#2111](https://github.com/influxdb/influxdb/pull/2111) and [#2025](https://github.com/influxdb/influxdb/issues/2025): Raft stability fixes. Non-contiguous log error and others.
+- [#2114](https://github.com/influxdb/influxdb/pull/2114): Correctly start influxd on platforms without start-stop-daemon.
+
+## v0.9.0-rc16 [2015-03-24]
+
+### Features
+- [#2058](https://github.com/influxdb/influxdb/pull/2058): Track number of queries executed in stats.
+- [#2059](https://github.com/influxdb/influxdb/pull/2059): Retention policies sorted by name on return to client.
+- [#2061](https://github.com/influxdb/influxdb/pull/2061): Implement SHOW DIAGNOSTICS.
+- [#2064](https://github.com/influxdb/influxdb/pull/2064): Allow init.d script to return influxd version.
+- [#2053](https://github.com/influxdb/influxdb/pull/2053): Implment backup and restore.
+- [#1631](https://github.com/influxdb/influxdb/pull/1631): Wire up DROP CONTINUOUS QUERY.
+
+### Bugfixes
+- [#2037](https://github.com/influxdb/influxdb/pull/2037): Don't check 'configExists' at Run() level.
+- [#2039](https://github.com/influxdb/influxdb/pull/2039): Don't panic if getting current user fails.
+- [#2034](https://github.com/influxdb/influxdb/pull/2034): GROUP BY should require an aggregate.
+- [#2040](https://github.com/influxdb/influxdb/pull/2040): Add missing top-level help for config command.
+- [#2057](https://github.com/influxdb/influxdb/pull/2057): Move racy "in order" test to integration test suite.
+- [#2060](https://github.com/influxdb/influxdb/pull/2060): Reload server shard map on restart.
+- [#2068](https://github.com/influxdb/influxdb/pull/2068): Fix misspelled JSON field.
+- [#2067](https://github.com/influxdb/influxdb/pull/2067): Fixed issue where some queries didn't properly pull back data (introduced in RC15). Fixing intervals for GROUP BY.
+
+## v0.9.0-rc15 [2015-03-19]
+
+### Features
+- [#2000](https://github.com/influxdb/influxdb/pull/2000): Log broker path when broker fails to start. Thanks @gst.
+- [#2007](https://github.com/influxdb/influxdb/pull/2007): Track shard-level stats.
+
+### Bugfixes
+- [#2001](https://github.com/influxdb/influxdb/pull/2001): Ensure measurement not found returns status code 200.
+- [#1985](https://github.com/influxdb/influxdb/pull/1985): Set content-type JSON header before actually writing header. Thanks @dstrek.
+- [#2003](https://github.com/influxdb/influxdb/pull/2003): Set timestamp when writing monitoring stats.
+- [#2004](https://github.com/influxdb/influxdb/pull/2004): Limit group by to MaxGroupByPoints (currently 100,000).
+- [#2016](https://github.com/influxdb/influxdb/pull/2016): Fixing bucket alignment for group by. Thanks @jnutzmann
+- [#2021](https://github.com/influxdb/influxdb/pull/2021): Remove unnecessary formatting from log message. Thanks @simonkern
+
+
+## v0.9.0-rc14 [2015-03-18]
+
+### Bugfixes
+- [#1999](https://github.com/influxdb/influxdb/pull/1999): Return status code 200 for measurement not found errors on show series.
+
+## v0.9.0-rc13 [2015-03-17]
 
 ### Features
 - [#1974](https://github.com/influxdb/influxdb/pull/1974): Add time taken for request to the http server logs.
@@ -8,6 +72,7 @@
 - [#1975](https://github.com/influxdb/influxdb/pull/1975): Require `q` parameter for query endpoint.
 - [#1969](https://github.com/influxdb/influxdb/pull/1969): Print loaded config.
 - [#1987](https://github.com/influxdb/influxdb/pull/1987): Fix config print startup statement for when no config is provided.
+- [#1990](https://github.com/influxdb/influxdb/pull/1990): Drop measurement was taking too long due to transactions.
 
 ## v0.9.0-rc12 [2015-03-15]
 
@@ -20,6 +85,9 @@
 ### Features
 - [#1935](https://github.com/influxdb/influxdb/pull/1935): Implement stateless broker for Raft.
 - [#1936](https://github.com/influxdb/influxdb/pull/1936): Implement "SHOW STATS" and self-monitoring
+
+### Features
+- [#1909](https://github.com/influxdb/influxdb/pull/1909): Implement a dump command.
 
 ## v0.9.0-rc11 [2015-03-13]
 

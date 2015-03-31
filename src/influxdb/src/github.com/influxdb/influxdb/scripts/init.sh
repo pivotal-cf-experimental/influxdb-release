@@ -27,9 +27,20 @@ if [ -r $DEFAULT ]; then
     source $DEFAULT
 fi
 
-if [ "x$STDOUT" == "x" ]; then
+if [ -z "$STDOUT" ]; then
     STDOUT=/dev/null
 fi
+if [ ! -f "$STDOUT" ]; then
+    mkdir -p `dirname $STDOUT`
+fi
+
+if [ -z "$STDERR" ]; then
+    STDERR=/var/log/influxdb/influxd.log
+fi
+if [ ! -f "$STDERR" ]; then
+    mkdir -p `dirname $STDERR`
+fi
+
 
 OPEN_FILE_LIMIT=65536
 
@@ -106,9 +117,9 @@ case $1 in
 
         log_success_msg "Starting the process" "$name"
         if which start-stop-daemon > /dev/null 2>&1; then
-            start-stop-daemon --chuid influxdb:influxdb --start --quiet --pidfile $pidfile --exec $daemon -- -pidfile $pidfile -config $config > $STDOUT 2>&1 &
+            start-stop-daemon --chuid influxdb:influxdb --start --quiet --pidfile $pidfile --exec $daemon -- -pidfile $pidfile -config $config >$STDOUT 2>$STDERR &
         else
-            nohup $daemon run -config $config -pidfile $pidfile > $STDOUT 2>&1 &
+            nohup $daemon -pidfile $pidfile -config $config >$STDOUT 2>$STDERR &
         fi
         log_success_msg "$name process was started"
         ;;
@@ -150,9 +161,13 @@ case $1 in
         fi
         ;;
 
+    version)
+        $daemon version
+        ;;
+
     *)
         # For invalid arguments, print the usage message.
-        echo "Usage: $0 {start|stop|restart|status}"
+        echo "Usage: $0 {start|stop|restart|status|version}"
         exit 2
         ;;
 esac

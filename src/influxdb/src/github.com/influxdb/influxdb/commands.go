@@ -40,6 +40,7 @@ const (
 
 	// Continuous Query messages
 	createContinuousQueryMessageType = messaging.MessageType(0x70)
+	dropContinuousQueryMessageType   = messaging.MessageType(0x71)
 
 	// Write series data messages (per-topic)
 	writeRawSeriesMessageType = messaging.MessageType(0x80)
@@ -198,11 +199,16 @@ func (c *createMeasurementsIfNotExistsCommand) addFieldIfNotExists(measurement, 
 }
 
 type dropSeriesCommand struct {
-	Database            string              `json:"datbase"`
+	Database            string              `json:"database"`
 	SeriesByMeasurement map[string][]uint32 `json:"seriesIds"`
 }
 
 // createContinuousQueryCommand is the raft command for creating a continuous query on a database
 type createContinuousQueryCommand struct {
 	Query string `json:"query"`
+}
+
+type dropContinuousQueryCommand struct {
+	Name     string `json:"name"`
+	Database string `json:"database"`
 }
