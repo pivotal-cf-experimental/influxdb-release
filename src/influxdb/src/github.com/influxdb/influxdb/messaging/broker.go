@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"net/url"
@@ -468,41 +469,60 @@ func (b *Broker) Publish(m *Message) (uint64, error) {
 }
 
 // TopicReader returns a new topic reader for a topic starting from a given index.
-func (b *Broker) TopicReader(topicID, index uint64, streaming bool) io.ReadCloser {
+func (b *Broker) TopicReader(topicID, index uint64, streaming bool) interface {
+	io.ReadCloser
+	io.Seeker
+} {
 	return NewTopicReader(b.TopicPath(topicID), index, streaming)
 }
 
-// SetTopicMaxIndex updates the highest replicated index for a topic.
+// SetTopicMaxIndex updates the highest replicated index for a topic and data URL.
 // If a higher index is already set on the topic then the call is ignored.
 // This index is only held in memory and is used for topic segment reclamation.
-func (b *Broker) SetTopicMaxIndex(topicID, index uint64) error {
+// The higheset replciated index per data URL is tracked separately from the current index
+func (b *Broker) SetTopicMaxIndex(topicID, index uint64, u url.URL) error {
 	_, err := b.Publish(&Message{
 		Type: SetTopicMaxIndexMessageType,
-		Data: marshalTopicIndex(topicID, index),
+		Data: marshalTopicIndex(topicID, index, u),
 	})
 	return err
 }
 
 func (b *Broker) applySetTopicMaxIndex(m *Message) {
-	topicID, index := unmarshalTopicIndex(m.Data)
+	topicID, index, u := unmarshalTopicIndex(m.Data)
 
 	// Set index if it's not already set higher.
-	t := b.topics[topicID]
-	if t != nil && t.index < index {
-		t.index = index
+	if t := b.topics[topicID]; t != nil {
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		// Track the highest replicated index per data node URL
+		t.indexByURL[u] = index
+
+		if t.index < index {
+			t.index = index
+		}
 	}
 }
 
-func marshalTopicIndex(topicID, index uint64) []byte {
-	b := make([]byte, 16)
+func marshalTopicIndex(topicID, index uint64, u url.URL) []byte {
+	s := []byte(u.String())
+	b := make([]byte, 16+2+len(s))
 	binary.BigEndian.PutUint64(b[0:8], topicID)
 	binary.BigEndian.PutUint64(b[8:16], index)
+	binary.BigEndian.PutUint16(b[16:18], uint16(len(s))) // URL string length
+	n := copy(b[18:], s)                                 // URL string
+	assert(n == len(s), "marshal topic index too short. have %d, expectd %d", n, len(s))
 	return b
 }
 
-func unmarshalTopicIndex(b []byte) (topicID, index uint64) {
+func unmarshalTopicIndex(b []byte) (topicID, index uint64, u url.URL) {
+	assert(len(b) >= 18, "unmarshal topic index too short. have %d, expected %d", len(b), 20)
 	topicID = binary.BigEndian.Uint64(b[0:8])
 	index = binary.BigEndian.Uint64(b[8:16])
+	n := binary.BigEndian.Uint16(b[16:18])     // URL length
+	du, err := url.Parse(string(b[18 : 18+n])) // URL
+	assert(err == nil, "unmarshal binary error: %s", err)
+	u = *du
 	return
 }
 
@@ -619,8 +639,12 @@ const DefaultMaxSegmentSize = 10 * 1024 * 1024 // 10MB
 type Topic struct {
 	mu    sync.Mutex
 	id    uint64 // unique identifier
-	index uint64 // highest index replicated
+	index uint64 // current index
 	path  string // on-disk path
+
+	// highest index replicated per data url.  The unique set of keys across all topics
+	// provides a snapshot of the addresses of every data node in a cluster.
+	indexByURL map[url.URL]uint64
 
 	file   *os.File // last segment writer
 	opened bool
@@ -632,9 +656,9 @@ type Topic struct {
 // NewTopic returns a new instance of Topic.
 func NewTopic(id uint64, path string) *Topic {
 	return &Topic{
-		id:   id,
-		path: path,
-
+		id:             id,
+		path:           path,
+		indexByURL:     make(map[url.URL]uint64),
 		MaxSegmentSize: DefaultMaxSegmentSize,
 	}
 }
@@ -650,6 +674,24 @@ func (t *Topic) Index() uint64 {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.index
+}
+
+// DataURLs returns the data node URLs subscribed to this topic
+func (t *Topic) DataURLs() []url.URL {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var urls []url.URL
+	for u, _ := range t.indexByURL {
+		urls = append(urls, u)
+	}
+	return urls
+}
+
+// IndexForURL returns the highest index replicated for a given data URL.
+func (t *Topic) IndexForURL(u url.URL) uint64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.indexByURL[u]
 }
 
 // SegmentPath returns the path to a segment starting with a given log index.
@@ -697,9 +739,9 @@ func (t *Topic) Open() error {
 			s := segments.Last()
 
 			// Read the last segment and extract the last message index.
-			index, err := ReadSegmentMaxIndex(s.Path)
+			index, err := RecoverSegment(s.Path)
 			if err != nil {
-				return fmt.Errorf("read segment max index: %s", err)
+				return fmt.Errorf("recover segment: %s", err)
 			}
 			t.index = index
 
@@ -739,28 +781,6 @@ func (t *Topic) close() error {
 	return nil
 }
 
-// ReadIndex reads the highest available index for a topic from disk.
-func (t *Topic) ReadIndex() (uint64, error) {
-	// Read a list of all segments.
-	segments, err := ReadSegments(t.path)
-	if err != nil && !os.IsNotExist(err) {
-		return 0, fmt.Errorf("read segments: %s", err)
-	}
-
-	// Ignore if there are no available segments.
-	if len(segments) == 0 {
-		return 0, nil
-	}
-
-	// Read highest index on the last segment.
-	index, err := ReadSegmentMaxIndex(segments.Last().Path)
-	if err != nil {
-		return 0, fmt.Errorf("read segment max index: %s", err)
-	}
-
-	return index, nil
-}
-
 // WriteMessage writes a message to the end of the topic.
 func (t *Topic) WriteMessage(m *Message) error {
 	t.mu.Lock()
@@ -790,13 +810,8 @@ func (t *Topic) WriteMessage(m *Message) error {
 		t.file = f
 	}
 
-	// Encode message.
-	b := make([]byte, messageHeaderSize+len(m.Data))
-	copy(b, m.marshalHeader())
-	copy(b[messageHeaderSize:], m.Data)
-
 	// Write to last segment.
-	if _, err := t.file.Write(b); err != nil {
+	if _, err := m.WriteTo(t.file); err != nil {
 		return fmt.Errorf("write segment: %s", err)
 	}
 
@@ -941,8 +956,9 @@ func ReadSegmentByIndex(path string, index uint64) (*Segment, error) {
 	return segments[len(segments)-1], nil
 }
 
-// ReadSegmentMaxIndex returns the highest index recorded in a segment.
-func ReadSegmentMaxIndex(path string) (uint64, error) {
+// RecoverSegment parses the entire segment and truncates at any partial messages.
+// Returns the last index seen in the segment.
+func RecoverSegment(path string) (uint64, error) {
 	// Open segment file.
 	f, err := os.Open(path)
 	if os.IsNotExist(err) {
@@ -958,6 +974,16 @@ func ReadSegmentMaxIndex(path string) (uint64, error) {
 	for {
 		var m Message
 		if err := dec.Decode(&m); err == io.EOF {
+			return index, nil
+		} else if err == io.ErrUnexpectedEOF || err == ErrChecksum {
+			// The decoder will unread any partially read data so we can
+			// simply truncate at current position.
+			if n, err := f.Seek(0, os.SEEK_CUR); err != nil {
+				return 0, fmt.Errorf("seek: %s", err)
+			} else if err := os.Truncate(path, n); err != nil {
+				return 0, fmt.Errorf("truncate: n=%d, err=%s", n-1, err)
+			}
+
 			return index, nil
 		} else if err != nil {
 			return 0, fmt.Errorf("decode: %s", err)
@@ -990,6 +1016,19 @@ func NewTopicReader(path string, index uint64, streaming bool) *TopicReader {
 
 		PollInterval: DefaultPollInterval,
 	}
+}
+
+// Seek seeks to a position the current segment.
+func (r *TopicReader) Seek(offset int64, whence int) (int64, error) {
+	assert(whence == os.SEEK_CUR, "topic reader can only seek to a relative position")
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.file == nil {
+		return 0, nil
+	}
+	return r.file.Seek(offset, whence)
 }
 
 // Read reads the next bytes from the reader into the buffer.
@@ -1084,7 +1123,7 @@ func (r *TopicReader) seekAfterIndex(f *os.File, seek uint64) error {
 			return err
 		} else if m.Index >= seek {
 			// Seek to message start.
-			if _, err := f.Seek(-int64(messageHeaderSize+len(m.Data)), os.SEEK_CUR); err != nil {
+			if _, err := f.Seek(-int64(MessageChecksumSize+MessageHeaderSize+len(m.Data)), os.SEEK_CUR); err != nil {
 				return fmt.Errorf("seek: %s", err)
 			}
 			return nil
@@ -1177,8 +1216,13 @@ const (
 	SetTopicMaxIndexMessageType = BrokerMessageType | MessageType(0x00)
 )
 
-// The size of the encoded message header, in bytes.
-const messageHeaderSize = 2 + 8 + 8 + 4
+const (
+	// MessageChecksumSize is the size of the encoded message checksum, in bytes.
+	MessageChecksumSize = 4
+
+	// MessageHeaderSize is the size of the encoded message header, in bytes.
+	MessageHeaderSize = 2 + 8 + 8 + 4
+)
 
 // Message represents a single item in a topic.
 type Message struct {
@@ -1189,39 +1233,65 @@ type Message struct {
 }
 
 // WriteTo encodes and writes the message to a writer. Implements io.WriterTo.
-func (m *Message) WriteTo(w io.Writer) (n int64, err error) {
-	if n, err := w.Write(m.marshalHeader()); err != nil {
-		return int64(n), err
+func (m *Message) WriteTo(w io.Writer) (int64, error) {
+	b, err := m.MarshalBinary()
+	if err != nil {
+		return 0, err
 	}
-	if n, err := w.Write(m.Data); err != nil {
-		return int64(messageHeaderSize + n), err
-	}
-	return int64(messageHeaderSize + len(m.Data)), nil
+	n, err := w.Write(b)
+	return int64(n), err
 }
 
 // MarshalBinary returns a binary representation of the message.
 // This implements encoding.BinaryMarshaler. An error cannot be returned.
 func (m *Message) MarshalBinary() ([]byte, error) {
-	b := make([]byte, messageHeaderSize+len(m.Data))
-	copy(b, m.marshalHeader())
-	copy(b[messageHeaderSize:], m.Data)
+	// Encode message.
+	b := make([]byte, MessageChecksumSize+MessageHeaderSize+len(m.Data))
+	copy(b[MessageChecksumSize:], m.marshalHeader())
+	copy(b[MessageChecksumSize+MessageHeaderSize:], m.Data)
+
+	// Calculate and write the checksum.
+	h := fnv.New32a()
+	h.Write(b[MessageChecksumSize:])
+	binary.BigEndian.PutUint32(b, h.Sum32())
+
 	return b, nil
 }
 
 // UnmarshalBinary reads a message from a binary encoded slice.
 // This implements encoding.BinaryUnmarshaler.
 func (m *Message) UnmarshalBinary(b []byte) error {
-	m.unmarshalHeader(b)
-	if len(b[messageHeaderSize:]) < len(m.Data) {
-		return fmt.Errorf("message data too short: %d < %d", len(b[messageHeaderSize:]), len(m.Data))
+	// Read checksum.
+	if len(b) < MessageChecksumSize {
+		return fmt.Errorf("message checksum too short: %d < %d", len(b), MessageChecksumSize)
 	}
-	copy(m.Data, b[messageHeaderSize:])
+	sum := binary.BigEndian.Uint32(b)
+
+	// Read header.
+	if len(b)-MessageChecksumSize < MessageHeaderSize {
+		return fmt.Errorf("message header too short: %d < %d", len(b)-MessageChecksumSize, MessageHeaderSize)
+	}
+	m.unmarshalHeader(b[MessageChecksumSize:])
+
+	// Read data.
+	if len(b)-MessageChecksumSize-MessageHeaderSize < len(m.Data) {
+		return fmt.Errorf("message data too short: %d < %d", len(b)-MessageChecksumSize-MessageHeaderSize, len(m.Data))
+	}
+	copy(m.Data, b[MessageChecksumSize+MessageHeaderSize:])
+
+	// Verify checksum.
+	h := fnv.New32a()
+	h.Write(b[MessageChecksumSize:])
+	if h.Sum32() != sum {
+		return ErrChecksum
+	}
+
 	return nil
 }
 
 // marshalHeader returns a byte slice with the message header.
 func (m *Message) marshalHeader() []byte {
-	b := make([]byte, messageHeaderSize)
+	b := make([]byte, MessageHeaderSize)
 	binary.BigEndian.PutUint16(b[0:2], uint16(m.Type))
 	binary.BigEndian.PutUint64(b[2:10], m.TopicID)
 	binary.BigEndian.PutUint64(b[10:18], m.Index)
@@ -1240,28 +1310,57 @@ func (m *Message) unmarshalHeader(b []byte) {
 
 // MessageDecoder decodes messages from a reader.
 type MessageDecoder struct {
-	r io.Reader
+	r io.ReadSeeker
 }
 
 // NewMessageDecoder returns a new instance of the MessageDecoder.
-func NewMessageDecoder(r io.Reader) *MessageDecoder {
+func NewMessageDecoder(r io.ReadSeeker) *MessageDecoder {
 	return &MessageDecoder{r: r}
 }
 
 // Decode reads a message from the decoder's reader.
 func (dec *MessageDecoder) Decode(m *Message) error {
 	// Read header bytes.
-	var b [messageHeaderSize]byte
-	if _, err := io.ReadFull(dec.r, b[:]); err == io.EOF {
+	// Unread if there is a partial read.
+	var b [MessageChecksumSize + MessageHeaderSize]byte
+	if n, err := io.ReadFull(dec.r, b[:]); err == io.EOF {
+		return err
+	} else if err == io.ErrUnexpectedEOF {
+		if _, err := dec.r.Seek(-int64(n), os.SEEK_CUR); err != nil {
+			return fmt.Errorf("cannot unread header: n=%d, err=%s", n, err)
+		}
+		warnf("unexpected eof(0): len=%d, n=%d, err=%s", len(b[:]), n, err)
 		return err
 	} else if err != nil {
 		return fmt.Errorf("read header: %s", err)
 	}
-	m.unmarshalHeader(b[:])
+
+	// Read checksum.
+	sum := binary.BigEndian.Uint32(b[:])
+
+	// Read header.
+	m.unmarshalHeader(b[MessageChecksumSize:])
 
 	// Read data.
-	if _, err := io.ReadFull(dec.r, m.Data); err != nil {
-		return fmt.Errorf("read body: %s", err)
+	if n, err := io.ReadFull(dec.r, m.Data); err == io.EOF || err == io.ErrUnexpectedEOF {
+		if _, err := dec.r.Seek(-int64(len(b)+n), os.SEEK_CUR); err != nil {
+			return fmt.Errorf("cannot unread header+data: n=%d, err=%s", n, err)
+		}
+		warnf("unexpected eof(1): len=%d, n=%d, err=%s", len(m.Data), n, err)
+		return io.ErrUnexpectedEOF
+	} else if err != nil {
+		return fmt.Errorf("read data: %s", err)
+	}
+
+	// Verify checksum.
+	h := fnv.New32a()
+	h.Write(b[MessageChecksumSize:])
+	h.Write(m.Data)
+	if h.Sum32() != sum {
+		if _, err := dec.r.Seek(-int64(len(b)+len(m.Data)), os.SEEK_CUR); err != nil {
+			return fmt.Errorf("cannot unread after checksum: err=%s", err)
+		}
+		return ErrChecksum
 	}
 
 	return nil
@@ -1274,37 +1373,6 @@ func UnmarshalMessage(data []byte) (*Message, error) {
 		return nil, err
 	}
 	return m, nil
-}
-
-type flusher interface {
-	Flush()
-}
-
-// uint64Slice attaches the methods of Interface to []int, sorting in increasing order.
-type uint64Slice []uint64
-
-func (p uint64Slice) Len() int           { return len(p) }
-func (p uint64Slice) Less(i, j int) bool { return p[i] < p[j] }
-func (p uint64Slice) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
-
-// mustMarshalJSON encodes a value to JSON.
-// This will panic if an error occurs. This should only be used internally when
-// an invalid marshal will cause corruption and a panic is appropriate.
-func mustMarshalJSON(v interface{}) []byte {
-	b, err := json.Marshal(v)
-	if err != nil {
-		panic("marshal: " + err.Error())
-	}
-	return b
-}
-
-// mustUnmarshalJSON decodes a value from JSON.
-// This will panic if an error occurs. This should only be used internally when
-// an invalid unmarshal will cause corruption and a panic is appropriate.
-func mustUnmarshalJSON(b []byte, v interface{}) {
-	if err := json.Unmarshal(b, v); err != nil {
-		panic("unmarshal: " + err.Error())
-	}
 }
 
 // assert will panic with a given formatted message if the given condition is false.

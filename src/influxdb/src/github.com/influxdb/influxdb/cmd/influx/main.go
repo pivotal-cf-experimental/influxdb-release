@@ -42,6 +42,7 @@ type CommandLine struct {
 	Pretty     bool   // controls pretty print for json
 	Format     string // controls the output format.  Valid values are json, csv, or column
 	ShouldDump bool
+	Execute    string
 }
 
 func main() {
@@ -55,6 +56,7 @@ func main() {
 	fs.StringVar(&c.Database, "database", c.Database, "database to connect to the server.")
 	fs.StringVar(&c.Format, "output", default_format, "format specifies the format of the server responses:  json, csv, or column")
 	fs.BoolVar(&c.ShouldDump, "dump", false, "dump the contents of the given database to stdout")
+	fs.StringVar(&c.Execute, "execute", c.Execute, "Execute command and quit.")
 	fs.Parse(os.Args[1:])
 
 	var promptForPassword bool
@@ -83,6 +85,11 @@ func main() {
 
 	if c.ShouldDump {
 		c.dump()
+		return
+	}
+
+	if c.Execute != "" {
+		c.executeQuery(c.Execute)
 		return
 	}
 
@@ -211,7 +218,7 @@ func (c *CommandLine) connect(cmd string) {
 		fmt.Printf("Failed to connect to %s\n", c.Client.Addr())
 	} else {
 		c.Version = v
-		if !c.ShouldDump {
+		if !c.ShouldDump && c.Execute == "" {
 			fmt.Printf("Connected to %s version %s\n", c.Client.Addr(), c.Version)
 		}
 	}
@@ -271,14 +278,14 @@ func (c *CommandLine) dump() {
 }
 
 func (c *CommandLine) executeQuery(query string) {
-	results, err := c.Client.Query(client.Query{Command: query, Database: c.Database})
+	response, err := c.Client.Query(client.Query{Command: query, Database: c.Database})
 	if err != nil {
 		fmt.Printf("ERR: %s\n", err)
 		return
 	}
-	c.FormatResults(results, os.Stdout)
-	if results.Error() != nil {
-		fmt.Printf("ERR: %s\n", results.Error())
+	c.FormatResponse(response, os.Stdout)
+	if response.Error() != nil {
+		fmt.Printf("ERR: %s\n", response.Error())
 		if c.Database == "" {
 			fmt.Println("Warning: It is possible this error is due to not setting a database.")
 			fmt.Println(`Please set a database with the command "use <database>".`)
@@ -286,26 +293,26 @@ func (c *CommandLine) executeQuery(query string) {
 	}
 }
 
-func (c *CommandLine) FormatResults(results *client.Results, w io.Writer) {
+func (c *CommandLine) FormatResponse(response *client.Response, w io.Writer) {
 	switch c.Format {
 	case "json":
-		c.writeJSON(results, w)
+		c.writeJSON(response, w)
 	case "csv":
-		c.writeCSV(results, w)
+		c.writeCSV(response, w)
 	case "column":
-		c.writeColumns(results, w)
+		c.writeColumns(response, w)
 	default:
 		fmt.Fprintf(w, "Unknown output format %q.\n", c.Format)
 	}
 }
 
-func (c *CommandLine) writeJSON(results *client.Results, w io.Writer) {
+func (c *CommandLine) writeJSON(response *client.Response, w io.Writer) {
 	var data []byte
 	var err error
 	if c.Pretty {
-		data, err = json.MarshalIndent(results, "", "    ")
+		data, err = json.MarshalIndent(response, "", "    ")
 	} else {
-		data, err = json.Marshal(results)
+		data, err = json.Marshal(response)
 	}
 	if err != nil {
 		fmt.Fprintf(w, "Unable to parse json: %s\n", err)
@@ -314,9 +321,9 @@ func (c *CommandLine) writeJSON(results *client.Results, w io.Writer) {
 	fmt.Fprintln(w, string(data))
 }
 
-func (c *CommandLine) writeCSV(results *client.Results, w io.Writer) {
+func (c *CommandLine) writeCSV(response *client.Response, w io.Writer) {
 	csvw := csv.NewWriter(w)
-	for _, result := range results.Results {
+	for _, result := range response.Results {
 		// Create a tabbed writer for each result as they won't always line up
 		rows := c.formatResults(result, "\t")
 		for _, r := range rows {
@@ -326,8 +333,8 @@ func (c *CommandLine) writeCSV(results *client.Results, w io.Writer) {
 	}
 }
 
-func (c *CommandLine) writeColumns(results *client.Results, w io.Writer) {
-	for _, result := range results.Results {
+func (c *CommandLine) writeColumns(response *client.Response, w io.Writer) {
+	for _, result := range response.Results {
 		// Create a tabbed writer for each result a they won't always line up
 		w := new(tabwriter.Writer)
 		w.Init(os.Stdout, 0, 8, 1, '\t', 0)

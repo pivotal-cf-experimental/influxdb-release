@@ -27,10 +27,6 @@ var (
 	// ErrReplicaIDRequired is returned when creating a replica without an id.
 	ErrReplicaIDRequired = errors.New("replica id required")
 
-	// errReplicaUnavailable is returned when writing bytes to a replica when
-	// there is no writer attached to the replica.
-	errReplicaUnavailable = errors.New("replica unavailable")
-
 	// ErrClientOpen is returned when opening an already open client.
 	ErrClientOpen = errors.New("client already open")
 
@@ -70,6 +66,12 @@ var (
 	// ErrReaderClosed is returned when reading from a closed topic reader.
 	ErrReaderClosed = errors.New("reader closed")
 
+	// ErrURLRequired is returned when making a call without a url parameter
+	ErrURLRequired = errors.New("url required")
+
 	// ErrMessageDataRequired is returned when publishing a message without data.
 	ErrMessageDataRequired = errors.New("message data required")
+
+	// ErrChecksum is returned when decoding a message with corrupt data.
+	ErrChecksum = errors.New("checksum error")
 )

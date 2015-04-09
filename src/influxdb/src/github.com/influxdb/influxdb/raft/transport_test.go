@@ -16,6 +16,10 @@ import (
 	"github.com/influxdb/influxdb/raft"
 )
 
+func is_connection_refused(err error) bool {
+	return strings.Contains(err.Error(), `connection refused`) || strings.Contains(err.Error(), `No connection could be made`)
+}
+
 // Ensure a join over HTTP can be read and responded to.
 func TestHTTPTransport_Join(t *testing.T) {
 	// Start mock HTTP server.
@@ -49,7 +53,7 @@ func TestHTTPTransport_Join(t *testing.T) {
 // Ensure that joining a server that doesn't exist returns an error.
 func TestHTTPTransport_Join_ErrConnectionRefused(t *testing.T) {
 	_, _, _, err := (&raft.HTTPTransport{}).Join(url.URL{Scheme: "http", Host: "localhost:27322"}, url.URL{Host: "local"})
-	if err == nil || !strings.Contains(err.Error(), "connection refused") {
+	if err == nil || !is_connection_refused(err) {
 		t.Fatalf("unexpected error: %s", err)
 	}
 }
@@ -144,7 +148,7 @@ func TestHTTPTransport_Leave(t *testing.T) {
 // Ensure that leaving a server that doesn't exist returns an error.
 func TestHTTPTransport_Leave_ErrConnectionRefused(t *testing.T) {
 	err := (&raft.HTTPTransport{}).Leave(url.URL{Scheme: "http", Host: "localhost:27322"}, 1)
-	if err == nil || !strings.Contains(err.Error(), "connection refused") {
+	if err == nil || !is_connection_refused(err) {
 		t.Fatalf("unexpected error: %s", err)
 	}
 }
@@ -231,7 +235,7 @@ func TestHTTPTransport_Heartbeat_ErrConnectionRefused(t *testing.T) {
 	_, err := (&raft.HTTPTransport{}).Heartbeat(*u, 0, 0, 0)
 	if err == nil {
 		t.Fatal("expected error")
-	} else if !strings.Contains(err.Error(), `connection refused`) {
+	} else if !is_connection_refused(err) {
 		t.Fatalf("unexpected error: %s", err)
 	}
 }
@@ -294,7 +298,7 @@ func TestHTTPTransport_ReadFrom_ErrConnectionRefused(t *testing.T) {
 	_, err := (&raft.HTTPTransport{}).ReadFrom(*u, 0, 0, 0)
 	if err == nil {
 		t.Fatal("expected error")
-	} else if !strings.Contains(err.Error(), `connection refused`) {
+	} else if !is_connection_refused(err) {
 		t.Fatalf("unexpected error: %s", err)
 	}
 }
@@ -318,14 +322,17 @@ func TestHTTPTransport_RequestVote(t *testing.T) {
 		if lastLogTerm := r.FormValue("lastLogTerm"); lastLogTerm != `4` {
 			t.Fatalf("unexpected last log term: %v", lastLogTerm)
 		}
+		w.Header().Set("X-Raft-Term", `100`)
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer s.Close()
 
 	// Execute heartbeat against test server.
 	u, _ := url.Parse(s.URL)
-	if err := (&raft.HTTPTransport{}).RequestVote(*u, 1, 2, 3, 4); err != nil {
+	if peerTerm, err := (&raft.HTTPTransport{}).RequestVote(*u, 1, 2, 3, 4); err != nil {
 		t.Fatalf("unexpected error: %s", err)
+	} else if peerTerm != 100 {
+		t.Fatalf("unexpected peer term: %d", peerTerm)
 	}
 }
 
@@ -339,7 +346,7 @@ func TestHTTPTransport_RequestVote_Error(t *testing.T) {
 	defer s.Close()
 
 	u, _ := url.Parse(s.URL)
-	if err := (&raft.HTTPTransport{}).RequestVote(*u, 0, 0, 0, 0); err == nil {
+	if _, err := (&raft.HTTPTransport{}).RequestVote(*u, 0, 0, 0, 0); err == nil {
 		t.Errorf("expected error")
 	} else if err.Error() != `already voted` {
 		t.Errorf("unexpected error: %s", err)
@@ -349,9 +356,9 @@ func TestHTTPTransport_RequestVote_Error(t *testing.T) {
 // Ensure that requesting a vote over HTTP to a stopped server returns an error.
 func TestHTTPTransport_RequestVote_ErrConnectionRefused(t *testing.T) {
 	u, _ := url.Parse("http://localhost:41932")
-	if err := (&raft.HTTPTransport{}).RequestVote(*u, 0, 0, 0, 0); err == nil {
+	if _, err := (&raft.HTTPTransport{}).RequestVote(*u, 0, 0, 0, 0); err == nil {
 		t.Fatal("expected error")
-	} else if !strings.Contains(err.Error(), `connection refused`) {
+	} else if !is_connection_refused(err) {
 		t.Fatalf("unexpected error: %s", err)
 	}
 }
@@ -426,10 +433,10 @@ func (t *Transport) ReadFrom(u url.URL, id, term, index uint64) (io.ReadCloser, 
 }
 
 // RequestVote calls RequestVote() on the target log.
-func (t *Transport) RequestVote(u url.URL, term, candidateID, lastLogIndex, lastLogTerm uint64) error {
+func (t *Transport) RequestVote(u url.URL, term, candidateID, lastLogIndex, lastLogTerm uint64) (uint64, error) {
 	l, err := t.log(u)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	return l.RequestVote(term, candidateID, lastLogIndex, lastLogTerm)
 }

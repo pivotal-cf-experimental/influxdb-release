@@ -74,6 +74,7 @@ const (
 	EXISTS
 	EXPLAIN
 	FIELD
+	FOR
 	FROM
 	GRANT
 	GROUP
@@ -104,6 +105,7 @@ const (
 	SELECT
 	SERIES
 	SERVERS
+	SET
 	SHOW
 	SLIMIT
 	STATS
@@ -177,6 +179,7 @@ var tokens = [...]string{
 	EXISTS:       "EXISTS",
 	EXPLAIN:      "EXPLAIN",
 	FIELD:        "FIELD",
+	FOR:          "FOR",
 	FROM:         "FROM",
 	GRANT:        "GRANT",
 	GROUP:        "GROUP",
@@ -207,6 +210,7 @@ var tokens = [...]string{
 	SELECT:       "SELECT",
 	SERIES:       "SERIES",
 	SERVERS:      "SERVERS",
+	SET:          "SET",
 	SHOW:         "SHOW",
 	SLIMIT:       "SLIMIT",
 	SOFFSET:      "SOFFSET",
@@ -227,11 +231,9 @@ var keywords map[string]Token
 func init() {
 	keywords = make(map[string]Token)
 	for tok := keyword_beg + 1; tok < keyword_end; tok++ {
-		keywords[strings.ToUpper(tokens[tok])] = tok
 		keywords[strings.ToLower(tokens[tok])] = tok
 	}
 	for _, tok := range []Token{AND, OR} {
-		keywords[strings.ToUpper(tokens[tok])] = tok
 		keywords[strings.ToLower(tokens[tok])] = tok
 	}
 	keywords["true"] = TRUE
@@ -276,7 +278,7 @@ func tokstr(tok Token, lit string) string {
 
 // Lookup returns the token associated with a given string.
 func Lookup(ident string) Token {
-	if tok, ok := keywords[ident]; ok {
+	if tok, ok := keywords[strings.ToLower(ident)]; ok {
 		return tok
 	}
 	return IDENT

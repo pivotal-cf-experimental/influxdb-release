@@ -36,31 +36,28 @@ func (tx *tx) SetNow(now time.Time) { tx.now = now }
 func (tx *tx) CreateMapReduceJobs(stmt *influxql.SelectStatement, tagKeys []string) ([]*influxql.MapReduceJob, error) {
 	jobs := []*influxql.MapReduceJob{}
 	for _, src := range stmt.Sources {
-		measurementName := src.(*influxql.Measurement).Name
-
-		// Parse the source segments.
-		database, policyName, measurement, err := splitIdent(measurementName)
-		if err != nil {
-			return nil, err
+		mm, ok := src.(*influxql.Measurement)
+		if !ok {
+			return nil, fmt.Errorf("invalid source type: %#v", src)
 		}
 
 		// Find database and retention policy.
-		db := tx.server.databases[database]
+		db := tx.server.databases[mm.Database]
 		if db == nil {
-			return nil, ErrDatabaseNotFound
+			return nil, ErrDatabaseNotFound(mm.Database)
 		}
-		rp := db.policies[policyName]
+		rp := db.policies[mm.RetentionPolicy]
 		if rp == nil {
 			return nil, ErrRetentionPolicyNotFound
 		}
 
 		// Find measurement.
-		m, err := tx.server.measurement(database, measurement)
+		m, err := tx.server.measurement(mm.Database, mm.Name)
 		if err != nil {
 			return nil, err
 		}
 		if m == nil {
-			return nil, ErrMeasurementNotFound
+			return nil, ErrMeasurementNotFound(influxql.QuoteIdent([]string{mm.Database, "", mm.Name}...))
 		}
 
 		tx.measurement = m
@@ -226,6 +223,7 @@ type LocalMapper struct {
 	selectFields    []*Field               // field names that occur in the select clause
 	selectTags      []string               // tag keys that occur in the select clause
 	isRaw           bool                   // if the query is a non-aggregate query
+	limit           int                    // used for raw queries to limit the amount of data read in before pushing out to client
 }
 
 // Open opens the LocalMapper.
@@ -318,13 +316,16 @@ func (l *LocalMapper) Begin(c *influxql.Call, startingTime int64) error {
 
 // NextInterval will get the time ordered next interval of the given interval size from the mapper. This is a
 // forward only operation from the start time passed into Begin. Will return nil when there is no more data to be read.
+// If this is a raw query, interval should be the max time to hit in the query
 func (l *LocalMapper) NextInterval(interval int64) (interface{}, error) {
 	if l.cursorsEmpty || l.tmin > l.job.TMax {
 		return nil, nil
 	}
 
 	// Set the upper bound of the interval.
-	if interval > 0 {
+	if l.isRaw {
+		l.tmax = interval
+	} else if interval > 0 {
 		// Make sure the bottom of the interval lands on a natural boundary.
 		l.tmax = l.tmin + interval - 1
 	}
@@ -341,15 +342,27 @@ func (l *LocalMapper) NextInterval(interval int64) (interface{}, error) {
 		}
 	}
 
-	// Move the interval forward.
-	l.tmin += interval
+	// Move the interval forward if it's not a raw query. For raw queries we use the limit to advance intervals.
+	if !l.isRaw {
+		l.tmin += interval
+	}
 
 	return val, nil
+}
+
+// SetLimit will tell the mapper to only yield that number of points (or to the max time) to Next
+func (l *LocalMapper) SetLimit(limit int) {
+	l.limit = limit
 }
 
 // Next returns the next matching timestamped value for the LocalMapper.
 func (l *LocalMapper) Next() (seriesID uint32, timestamp int64, value interface{}) {
 	for {
+		// if it's a raw query and we've hit the limit of the number of points to read in, bail
+		if l.isRaw && l.limit == 0 {
+			return uint32(0), int64(0), nil
+		}
+
 		// find the minimum timestamp
 		min := -1
 		minKey := int64(math.MaxInt64)
@@ -373,13 +386,14 @@ func (l *LocalMapper) Next() (seriesID uint32, timestamp int64, value interface{
 		var value interface{}
 		var err error
 		if l.isRaw && len(l.selectFields) > 1 {
-			fieldsWithNames := l.decoder.DecodeFieldsWithNames(l.valueBuffer[min])
-			value = fieldsWithNames
+			if fieldsWithNames, err := l.decoder.DecodeFieldsWithNames(l.valueBuffer[min]); err == nil {
+				value = fieldsWithNames
 
-			// if there's a where clause, make sure we don't need to filter this value
-			if l.filters[min] != nil {
-				if !matchesWhere(l.filters[min], fieldsWithNames) {
-					value = nil
+				// if there's a where clause, make sure we don't need to filter this value
+				if l.filters[min] != nil {
+					if !matchesWhere(l.filters[min], fieldsWithNames) {
+						value = nil
+					}
 				}
 			}
 		} else {
@@ -393,8 +407,8 @@ func (l *LocalMapper) Next() (seriesID uint32, timestamp int64, value interface{
 						value = nil
 					}
 				} else { // decode everything
-					fieldsWithNames := l.decoder.DecodeFieldsWithNames(l.valueBuffer[min])
-					if !matchesWhere(l.filters[min], fieldsWithNames) {
+					fieldsWithNames, err := l.decoder.DecodeFieldsWithNames(l.valueBuffer[min])
+					if err != nil || !matchesWhere(l.filters[min], fieldsWithNames) {
 						value = nil
 					}
 				}
@@ -415,6 +429,11 @@ func (l *LocalMapper) Next() (seriesID uint32, timestamp int64, value interface{
 			continue
 		}
 
+		// if it's a raw query, we always limit the amount we read in
+		if l.isRaw {
+			l.limit--
+		}
+
 		return seriesID, timestamp, value
 	}
 }
@@ -427,19 +446,8 @@ func matchesWhere(f influxql.Expr, fields map[string]interface{}) bool {
 	return true
 }
 
-// splitIdent splits an identifier into it's database, policy, and measurement parts.
-func splitIdent(s string) (db, rp, m string, err error) {
-	a, err := influxql.SplitIdent(s)
-	if err != nil {
-		return "", "", "", err
-	} else if len(a) != 3 {
-		return "", "", "", fmt.Errorf("invalid ident, expected 3 segments: %q", s)
-	}
-	return a[0], a[1], a[2], nil
-}
-
 type fieldDecoder interface {
 	DecodeByID(fieldID uint8, b []byte) (interface{}, error)
 	FieldByName(name string) *Field
-	DecodeFieldsWithNames(b []byte) map[string]interface{}
+	DecodeFieldsWithNames(b []byte) (map[string]interface{}, error)
 }

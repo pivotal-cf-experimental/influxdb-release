@@ -8,11 +8,22 @@ import (
 	"net/url"
 	"os"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/influxdb/influxdb/messaging"
 )
+
+var testDataURL *url.URL
+
+func init() {
+	testDataURL, _ = url.Parse("http://localhost:1234/data")
+}
+
+func is_connection_refused(err error) bool {
+	return strings.Contains(err.Error(), `connection refused`) || strings.Contains(err.Error(), `No connection could be made`)
+}
 
 // Ensure a client can open the configuration file, if it exists.
 func TestClient_Open_WithConfig(t *testing.T) {
@@ -38,16 +49,21 @@ func TestClient_Open_WithConfig(t *testing.T) {
 func TestClient_Open_WithMissingConfig(t *testing.T) {
 	path := NewTempFile()
 	c := NewClient()
-	c.SetURLs([]url.URL{{Host: "//hostA"}})
+	c.SetURLs([]url.URL{{Host: "hostA"}})
 	if err := c.Open(path); err != nil {
 		t.Fatalf("unexpected error: %s", err)
 	}
 	defer c.Close()
 
 	// Verify that urls were cleared.
-	if a := c.URLs(); len(a) != 0 {
-		t.Fatalf("unexpected urls: %#v", a)
+	if a := c.URLs(); len(a) != 1 {
+		t.Fatalf("unexpected urls: exp 1, got: %d", len(a))
 	}
+
+	if exp, got := "//hostA", c.URLs()[0].String(); exp != got {
+		t.Fatalf("unexpected urls: exp %q, got: %v", got, exp)
+	}
+
 }
 
 // Ensure a client can return an error if the configuration file is corrupt.
@@ -67,6 +83,9 @@ func TestClient_Open_WithInvalidConfig(t *testing.T) {
 
 // Ensure a client can return an error if the configuration file has non-readable permissions.
 func TestClient_Open_WithBadPermConfig(t *testing.T) {
+	if "windows" == runtime.GOOS {
+		t.Skip("skip it on the windows")
+	}
 	// Write inaccessible configuration file.
 	path := NewTempFile()
 	defer os.Remove(path)
@@ -76,7 +95,7 @@ func TestClient_Open_WithBadPermConfig(t *testing.T) {
 	// Open new client against path.
 	c := NewClient()
 	if err := c.Open(path); err == nil || !strings.Contains(err.Error(), `permission denied`) {
-		t.Fatalf("unexpected error: %s", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 	defer c.Close()
 }
@@ -254,7 +273,7 @@ func TestClient_Publish_ErrConnectionRefused(t *testing.T) {
 	defer c.Close()
 
 	// Publish message to server.
-	if _, err := c.Publish(&messaging.Message{}); err == nil || !strings.Contains(err.Error(), `connection refused`) {
+	if _, err := c.Publish(&messaging.Message{}); err == nil || !is_connection_refused(err) {
 		t.Fatal(err)
 	}
 }
@@ -355,7 +374,7 @@ func TestClient_Ping_ErrConnectionRefused(t *testing.T) {
 	defer c.Close()
 
 	// Ping server.
-	if err := c.Ping(); err == nil || !strings.Contains(err.Error(), `connection refused`) {
+	if err := c.Ping(); err == nil || !is_connection_refused(err) {
 		t.Fatal(err)
 	}
 }
@@ -477,7 +496,7 @@ func TestClient_Conn(t *testing.T) {
 
 // Ensure that an error is returned when opening an opened connection.
 func TestConn_Open_ErrConnOpen(t *testing.T) {
-	c := messaging.NewConn(1)
+	c := messaging.NewConn(1, testDataURL)
 	c.Open(0, false)
 	defer c.Close()
 	if err := c.Open(0, false); err != messaging.ErrConnOpen {
@@ -487,7 +506,7 @@ func TestConn_Open_ErrConnOpen(t *testing.T) {
 
 // Ensure that an error is returned when opening a previously closed connection.
 func TestConn_Open_ErrConnCannotReuse(t *testing.T) {
-	c := messaging.NewConn(1)
+	c := messaging.NewConn(1, testDataURL)
 	c.Open(0, false)
 	c.Close()
 	if err := c.Open(0, false); err != messaging.ErrConnCannotReuse {
@@ -497,7 +516,7 @@ func TestConn_Open_ErrConnCannotReuse(t *testing.T) {
 
 // Ensure that an error is returned when closing a closed connection.
 func TestConn_Close_ErrConnClosed(t *testing.T) {
-	c := messaging.NewConn(1)
+	c := messaging.NewConn(1, testDataURL)
 	c.Open(0, false)
 	c.Close()
 	if err := c.Close(); err != messaging.ErrConnClosed {
@@ -524,7 +543,7 @@ func TestConn_Open(t *testing.T) {
 	defer s.Close()
 
 	// Create and open connection to server.
-	c := messaging.NewConn(100)
+	c := messaging.NewConn(100, testDataURL)
 	c.SetURL(*MustParseURL(s.URL))
 	if err := c.Open(200, false); err != nil {
 		t.Fatal(err)
@@ -561,7 +580,7 @@ func TestConn_Open_Reconnect(t *testing.T) {
 	defer s.Close()
 
 	// Create and open connection to server.
-	c := messaging.NewConn(100)
+	c := messaging.NewConn(100, testDataURL)
 	c.SetURL(*MustParseURL(s.URL))
 	if err := c.Open(0, false); err != nil {
 		t.Fatal(err)
@@ -590,12 +609,14 @@ func TestConn_Heartbeat(t *testing.T) {
 			t.Fatalf("unexpected topic id: %s", topicID)
 		} else if index := req.URL.Query().Get("index"); index != "200" {
 			t.Fatalf("unexpected index: %s", index)
+		} else if url := req.URL.Query().Get("url"); url != "http://localhost:1234/data" {
+			t.Fatalf("unexpected url: %s, got %s", "http://localhost:1234/data", url)
 		}
 	}))
 	defer s.Close()
 
 	// Create connection and heartbeat.
-	c := messaging.NewConn(100)
+	c := messaging.NewConn(100, testDataURL)
 	c.SetURL(*MustParseURL(s.URL))
 	c.SetIndex(200)
 	if err := c.Heartbeat(); err != nil {
@@ -609,9 +630,9 @@ func TestConn_Heartbeat_ErrConnectionRefused(t *testing.T) {
 	s.Close()
 
 	// Create connection and heartbeat.
-	c := messaging.NewConn(0)
+	c := messaging.NewConn(0, testDataURL)
 	c.SetURL(*MustParseURL(s.URL))
-	if err := c.Heartbeat(); err == nil || !strings.Contains(err.Error(), `connection refused`) {
+	if err := c.Heartbeat(); err == nil || !is_connection_refused(err) {
 		t.Fatalf("unexpected error: %s", err)
 	}
 }
@@ -625,7 +646,7 @@ func TestConn_Heartbeat_ErrNoLeader(t *testing.T) {
 	defer s.Close()
 
 	// Create connection and heartbeat.
-	c := messaging.NewConn(0)
+	c := messaging.NewConn(0, testDataURL)
 	c.SetURL(*MustParseURL(s.URL))
 	if err := c.Heartbeat(); err != messaging.ErrNoLeader {
 		t.Fatalf("unexpected error: %s", err)
@@ -641,7 +662,7 @@ func TestConn_Heartbeat_ErrBrokerError(t *testing.T) {
 	defer s.Close()
 
 	// Create connection and heartbeat.
-	c := messaging.NewConn(0)
+	c := messaging.NewConn(0, testDataURL)
 	c.SetURL(*MustParseURL(s.URL))
 	if err := c.Heartbeat(); err == nil || err.Error() != `oh no` {
 		t.Fatalf("unexpected error: %s", err)
@@ -656,7 +677,7 @@ func TestConn_Heartbeat_ErrHTTPError(t *testing.T) {
 	defer s.Close()
 
 	// Create connection and heartbeat.
-	c := messaging.NewConn(0)
+	c := messaging.NewConn(0, testDataURL)
 	c.SetURL(*MustParseURL(s.URL))
 	if err := c.Heartbeat(); err == nil || err.Error() != `heartbeat error: status=500` {
 		t.Fatalf("unexpected error: %s", err)
@@ -711,7 +732,7 @@ type Client struct {
 
 // NewClient returns an new instance of Client.
 func NewClient() *Client {
-	return &Client{messaging.NewClient()}
+	return &Client{messaging.NewClient(*testDataURL)}
 }
 
 // MustOpen opens the client. Panic on error.

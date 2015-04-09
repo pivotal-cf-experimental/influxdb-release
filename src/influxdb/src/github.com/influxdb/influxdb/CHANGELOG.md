@@ -1,8 +1,77 @@
-## v0.9.0-rc18 [Unreleased]
+## v0.9.0-rc23 [Unreleased]
+
+### Bugfixes
+- [#2225](https://github.com/influxdb/influxdb/pull/2225): Make keywords completely case insensitive
+- [#2228](https://github.com/influxdb/influxdb/pull/2228): Accept keyword default unquoted in ALTER RETENTION POLICY statement
+
+## v0.9.0-rc22 [2015-04-09]
+
+### Features
+- [#2214](https://github.com/influxdb/influxdb/pull/2214): Added the option to influx CLI to execute single command and exit. Thanks @n1tr0g
+
+### Bugfixes
+- [#2223](https://github.com/influxdb/influxdb/pull/2223): Always notify term change on RequestVote
+
+## v0.9.0-rc21 [2015-04-09]
+
+### Features
+- [#870](https://github.com/influxdb/influxdb/pull/870): Add support for OpenTSDB telnet input protocol. Thanks @tcolgate
+- [#2180](https://github.com/influxdb/influxdb/pull/2180): Allow http write handler to decode gzipped body
+- [#2175](https://github.com/influxdb/influxdb/pull/2175): Separate broker and data nodes
+- [#2158](https://github.com/influxdb/influxdb/pull/2158): Allow user password to be changed. Thanks @n1tr0g
+- [#2201](https://github.com/influxdb/influxdb/pull/2201): Bring back config join URLs
+- [#2121](https://github.com/influxdb/influxdb/pull/2121): Parser refactor
+
+### Bugfixes
+- [#2181](https://github.com/influxdb/influxdb/pull/2181): Fix panic on "SHOW DIAGNOSTICS".
+- [#2170](https://github.com/influxdb/influxdb/pull/2170): Make sure queries on missing tags return 200 status.
+- [#2197](https://github.com/influxdb/influxdb/pull/2197): Lock server during Open().
+- [#2200](https://github.com/influxdb/influxdb/pull/2200): Re-enable Continuous Queries.
+- [#2203](https://github.com/influxdb/influxdb/pull/2203): Fix race condition on continuous queries.
+- [#2217](https://github.com/influxdb/influxdb/pull/2217): Only revert to follower if new term is greater.
+- [#2219](https://github.com/influxdb/influxdb/pull/2219): Persist term change to disk when candidate. Thanks @cannium
+
+## v0.9.0-rc20 [2015-04-04]
+
+### Features
+- [#2128](https://github.com/influxdb/influxdb/pull/2128): Data node discovery from brokers
+- [#2142](https://github.com/influxdb/influxdb/pull/2142): Support chunked queries
+- [#2154](https://github.com/influxdb/influxdb/pull/2154): Node redirection
+- [#2168](https://github.com/influxdb/influxdb/pull/2168): Return raft term from vote, add term logging
+
+### Bugfixes
+- [#2147](https://github.com/influxdb/influxdb/pull/2147): Set Go Max procs in a better location
+- [#2137](https://github.com/influxdb/influxdb/pull/2137): Refactor `results` to `response`. Breaking Go Client change.
+- [#2151](https://github.com/influxdb/influxdb/pull/2151): Ignore replay commands on the metastore.
+- [#2152](https://github.com/influxdb/influxdb/issues/2152): Influxd process with stats enabled crashing with 'Unsuported protocol scheme for ""'
+- [#2156](https://github.com/influxdb/influxdb/pull/2156): Propagate error when resolving UDP address in Graphite UDP server.
+- [#2163](https://github.com/influxdb/influxdb/pull/2163): Fix up paths for default data and run storage.
+- [#2164](https://github.com/influxdb/influxdb/pull/2164): Append STDOUT/STDERR in initscript.
+- [#2165](https://github.com/influxdb/influxdb/pull/2165): Better name for config section for stats and diags.
+- [#2165](https://github.com/influxdb/influxdb/pull/2165): Monitoring database and retention policy are not configurable.
+- [#2167](https://github.com/influxdb/influxdb/pull/2167): Add broker log recovery.
+- [#2166](https://github.com/influxdb/influxdb/pull/2166): Don't panic if presented with a field of unknown type.
+- [#2149](https://github.com/influxdb/influxdb/pull/2149): Fix unit tests for win32 when directory doesn't exist.
+- [#2150](https://github.com/influxdb/influxdb/pull/2150): Fix unit tests for win32 when a connection is refused.
+
+## v0.9.0-rc19 [2015-04-01]
+
+### Features
+- [#2143](https://github.com/influxdb/influxdb/pull/2143): Add raft term logging.
+
+### Bugfixes
+- [#2145](https://github.com/influxdb/influxdb/pull/2145): Encode toml durations correctly which fixes default configuration generation `influxd config`.
+
+## v0.9.0-rc18 [2015-03-31]
 
 ### Bugfixes
 - [#2100](https://github.com/influxdb/influxdb/pull/2100): Use channel to synchronize collectd shutdown.
 - [#2100](https://github.com/influxdb/influxdb/pull/2100): Synchronize access to shard index.
+- [#2131](https://github.com/influxdb/influxdb/pull/2131): Optimize marshalTags().
+- [#2130](https://github.com/influxdb/influxdb/pull/2130): Make fewer calls to marshalTags().
+- [#2105](https://github.com/influxdb/influxdb/pull/2105): Support != for tag values. Fix issue #2097, thanks to @smonkewitz for bug report.
+- [#2105](https://github.com/influxdb/influxdb/pull/2105): Support !~ tags values.
+- [#2138](https://github.com/influxdb/influxdb/pull/2136): Use map for marshaledTags cache.
 
 ## v0.9.0-rc17 [2015-03-29]
 

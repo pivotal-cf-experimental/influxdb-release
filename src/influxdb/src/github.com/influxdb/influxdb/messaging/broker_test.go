@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -120,16 +119,25 @@ func TestBroker_Apply_SetMaxTopicIndex(t *testing.T) {
 		t.Fatal("topic not created")
 	}
 
+	testDataURL, _ := url.Parse("http://localhost:1234/data")
+	data := []byte{0, 0, 0, 0, 0, 0, 0, 20, 0, 0, 0, 0, 0, 0, 0, 5}    // topicID=20, index=5,
+	data = append(data, []byte{0, byte(len(testDataURL.String()))}...) // len= <url length>
+	data = append(data, []byte(testDataURL.String())...)
+
 	// Set topic #1's index to "2".
 	if err := b.Apply(&messaging.Message{
 		Index: 2,
 		Type:  messaging.SetTopicMaxIndexMessageType,
-		Data:  []byte{0, 0, 0, 0, 0, 0, 0, 20, 0, 0, 0, 0, 0, 0, 0, 5}, // topicID=20, index=5
+		Data:  data,
 	}); err != nil {
 		t.Fatalf("apply error: %s", err)
 	}
+
 	if topic := b.Topic(20); topic.Index() != 5 {
 		t.Fatalf("unexpected topic index: %d", topic.Index())
+	}
+	if topic := b.Topic(20); topic.IndexForURL(*testDataURL) != 5 {
+		t.Fatalf("unexpected topic url index: %d", topic.IndexForURL(*testDataURL))
 	}
 }
 
@@ -232,6 +240,9 @@ func TestBroker_SetTopicMaxIndex(t *testing.T) {
 	b := OpenBroker()
 	defer b.Close()
 
+	testDataURL, _ := url.Parse("http://localhost:1234/data")
+	urlData := []byte{0, byte(len(testDataURL.String()))} // len=26
+	urlData = append(urlData, []byte(testDataURL.String())...)
 	// Ensure the appropriate message is sent to the log.
 	b.Log().ApplyFunc = func(data []byte) (uint64, error) {
 		m, _ := messaging.UnmarshalMessage(data)
@@ -239,12 +250,14 @@ func TestBroker_SetTopicMaxIndex(t *testing.T) {
 			t.Fatalf("unexpected topic id data: %x", data[0:8])
 		} else if !bytes.Equal(m.Data[8:16], []byte{0, 0, 0, 0, 0, 0, 0, 2}) {
 			t.Fatalf("unexpected index data: %x", data[8:16])
+		} else if !bytes.Equal(m.Data[16:44], urlData) {
+			t.Fatalf("unexpected url data: %v", m.Data[16:44])
 		}
 		return 1, nil
 	}
 
 	// Set the highest replicated topic index.
-	if err := b.SetTopicMaxIndex(1, 2); err != nil {
+	if err := b.SetTopicMaxIndex(1, 2, *testDataURL); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -322,6 +335,114 @@ func (b *RaftFSMBroker) Index() uint64                             { return 0 }
 func (b *RaftFSMBroker) WriteTo(w io.Writer) (n int64, err error)  { return 0, nil }
 func (b *RaftFSMBroker) ReadFrom(r io.Reader) (n int64, err error) { return 0, nil }
 
+// Ensure a topic can recover if it has a partial message.
+func TestTopic_Recover_UnexpectedEOF(t *testing.T) {
+	topic := OpenTopic()
+	defer topic.Close()
+
+	// Write a messages.
+	if err := topic.WriteMessage(&messaging.Message{Index: 1, Data: make([]byte, 10)}); err != nil {
+		t.Fatal(err)
+	} else if err = topic.WriteMessage(&messaging.Message{Index: 2, Data: make([]byte, 10)}); err != nil {
+		t.Fatal(err)
+	} else if err = topic.WriteMessage(&messaging.Message{Index: 3, Data: make([]byte, 10)}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Close topic and trim the file by a few bytes.
+	topic.Topic.Close()
+	if fi, err := os.Stat(filepath.Join(topic.Path(), "1")); err != nil {
+		t.Fatal(err)
+	} else if err = os.Truncate(filepath.Join(topic.Path(), "1"), fi.Size()-5); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopen topic.
+	if err := topic.Open(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Rewrite the third message with a different data size.
+	if err := topic.WriteMessage(&messaging.Message{Index: 3, Data: make([]byte, 20)}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read all messages.
+	a := MustDecodeAllMessages(messaging.NewTopicReader(topic.Path(), 0, false))
+	if len(a) != 3 {
+		t.Fatalf("unexpected message count: %d", len(a))
+	} else if !reflect.DeepEqual(a[0], &messaging.Message{Index: 1, Data: make([]byte, 10)}) {
+		t.Fatalf("unexpected message(0): %#v", a[0])
+	} else if !reflect.DeepEqual(a[1], &messaging.Message{Index: 2, Data: make([]byte, 10)}) {
+		t.Fatalf("unexpected message(1): %#v", a[1])
+	} else if !reflect.DeepEqual(a[2], &messaging.Message{Index: 3, Data: make([]byte, 20)}) {
+		t.Fatalf("unexpected message(2): %#v", a[2])
+	}
+
+}
+
+// Ensure a topic can recover if it has a corrupt message.
+func TestTopic_Recover_Checksum(t *testing.T) {
+	topic := OpenTopic()
+	defer topic.Close()
+
+	// Write a message.
+	if err := topic.WriteMessage(&messaging.Message{Index: 1, Data: make([]byte, 10)}); err != nil {
+		t.Fatal(err)
+	} else if err = topic.WriteMessage(&messaging.Message{Index: 2, Data: make([]byte, 10)}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Close topic and change a few bytes.
+	topic.Topic.Close()
+	f, err := os.OpenFile(filepath.Join(topic.Path(), "1"), os.O_RDWR, 0666)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte{100}, (2*(messaging.MessageChecksumSize+messaging.MessageHeaderSize))+15); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	// Reopen topic.
+	if err := topic.Open(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Second message should be truncated.
+	a := MustDecodeAllMessages(messaging.NewTopicReader(topic.Path(), 0, false))
+	if len(a) != 1 {
+		t.Fatalf("unexpected message count: %d", len(a))
+	} else if !reflect.DeepEqual(a[0], &messaging.Message{Index: 1, Data: make([]byte, 10)}) {
+		t.Fatalf("unexpected message(0): %#v", a[0])
+	}
+}
+
+// Topic is a wrapper for messaging.Topic that creates the topic in a temporary location.
+type Topic struct {
+	*messaging.Topic
+}
+
+// NewTopic returns a new Topic instance.
+func NewTopic() *Topic {
+	return &Topic{messaging.NewTopic(1, tempfile())}
+}
+
+// OpenTopic returns a new, open Topic instance.
+func OpenTopic() *Topic {
+	t := NewTopic()
+	if err := t.Open(); err != nil {
+		panic("open: " + err.Error())
+	}
+	return t
+}
+
+// Close closes and deletes the temporary topic.
+func (t *Topic) Close() {
+	defer os.RemoveAll(t.Path())
+	t.Topic.Close()
+}
+
 // Ensure a list of topics can be read from a directory.
 func TestReadTopics(t *testing.T) {
 	path, _ := ioutil.TempDir("", "")
@@ -379,7 +500,7 @@ func TestReadSegments_ENOENT(t *testing.T) {
 	os.RemoveAll(path)
 
 	_, err := messaging.ReadSegments(path)
-	if err == nil || !strings.Contains(err.Error(), "no such file or directory") {
+	if err == nil || !os.IsNotExist(err) {
 		t.Fatal(err)
 	}
 }
@@ -440,7 +561,7 @@ func TestReadSegmentByIndex_ENOENT(t *testing.T) {
 	os.RemoveAll(path)
 
 	_, err := messaging.ReadSegmentByIndex(path, 0)
-	if err == nil || !strings.Contains(err.Error(), "no such file or directory") {
+	if err == nil || !os.IsNotExist(err) {
 		t.Fatalf("unexpected error: %s", err)
 	}
 }
@@ -686,20 +807,10 @@ func (b *Broker) Log() *BrokerLog {
 }
 
 // MustReadAllTopic reads all messages on a topic. Panic on error.
-func (b *Broker) MustReadAllTopic(topicID uint64) (a []*messaging.Message) {
+func (b *Broker) MustReadAllTopic(topicID uint64) []*messaging.Message {
 	r := b.TopicReader(topicID, 0, false)
 	defer r.Close()
-
-	dec := messaging.NewMessageDecoder(r)
-	for {
-		m := &messaging.Message{}
-		if err := dec.Decode(m); err == io.EOF {
-			return
-		} else if err != nil {
-			panic("read all topic: " + err.Error())
-		}
-		a = append(a, m)
-	}
+	return MustDecodeAllMessages(r)
 }
 
 // BrokerLog is a mockable object that implements Broker.Log.
@@ -755,6 +866,23 @@ func MustWriteFile(filename string, data []byte) {
 	}
 	if err := ioutil.WriteFile(filename, data, 0666); err != nil {
 		panic(err.Error())
+	}
+}
+
+// MustDecodeAllMessages reads all messages on a reader.
+func MustDecodeAllMessages(r interface {
+	io.ReadCloser
+	io.Seeker
+}) (a []*messaging.Message) {
+	dec := messaging.NewMessageDecoder(r)
+	for {
+		m := &messaging.Message{}
+		if err := dec.Decode(m); err == io.EOF {
+			return
+		} else if err != nil {
+			panic("read all: " + err.Error())
+		}
+		a = append(a, m)
 	}
 }
 

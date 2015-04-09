@@ -376,19 +376,36 @@ func (m *Measurement) idsForExpr(n *influxql.BinaryExpr) (seriesIDs, bool, influ
 		return nil, true, nil
 	}
 
-	// if we're looking for series with a specific tag value
+	// if we're looking for series with specific tag values
 	if str, ok := value.(*influxql.StringLiteral); ok {
-		return tagVals[str.Val], true, nil
+		var ids seriesIDs
+
+		if n.Op == influxql.EQ {
+			// return series that have a tag of specific value.
+			ids = tagVals[str.Val]
+		} else if n.Op == influxql.NEQ {
+			ids = m.seriesIDs.reject(tagVals[str.Val])
+		}
+		return ids, true, nil
 	}
 
 	// if we're looking for series with tag values that match a regex
 	if re, ok := value.(*influxql.RegexLiteral); ok {
 		var ids seriesIDs
+
+		// The operation is a NEQREGEX, code must start by assuming all match, even
+		// series without any tags.
+		if n.Op == influxql.NEQREGEX {
+			ids = m.seriesIDs
+		}
+
 		for k := range tagVals {
 			match := re.Val.MatchString(k)
 
-			if (match && n.Op == influxql.EQREGEX) || (!match && n.Op == influxql.NEQREGEX) {
+			if match && n.Op == influxql.EQREGEX {
 				ids = ids.union(tagVals[k])
+			} else if match && n.Op == influxql.NEQREGEX {
+				ids = ids.reject(tagVals[k])
 			}
 		}
 		return ids, true, nil
@@ -796,7 +813,7 @@ func (f *FieldCodec) EncodeFields(values map[string]interface{}) ([]byte, error)
 				buf[i+3] = byte(c)
 			}
 		default:
-			panic(fmt.Sprintf("unsupported value type: %T", v))
+			panic(fmt.Sprintf("unsupported value type during encode fields: %T", v))
 		}
 
 		// Always set the field ID as the leading byte.
@@ -823,7 +840,12 @@ func (f *FieldCodec) DecodeByID(targetID uint8, b []byte) (interface{}, error) {
 		}
 		field, ok := f.fieldsByID[b[0]]
 		if !ok {
-			panic(fmt.Sprintf("field ID %d has no mapping", b[0]))
+			// This can happen, though is very unlikely. If this node receives encoded data, to be written
+			// to disk, and is queried for that data before its metastore is updated, there will be no field
+			// mapping for the data during decode. All this can happen because data is encoded by the node
+			// that first received the write request, not the node that actually writes the data to disk.
+			// So if this happens, the read must be aborted.
+			return 0, ErrFieldUnmappedID
 		}
 
 		var value interface{}
@@ -846,7 +868,7 @@ func (f *FieldCodec) DecodeByID(targetID uint8, b []byte) (interface{}, error) {
 			// Move bytes forward.
 			b = b[size+3:]
 		default:
-			panic(fmt.Sprintf("unsupported value type: %T", field.Type))
+			panic(fmt.Sprintf("unsupported value type during decode by id: %T", field.Type))
 		}
 
 		if field.ID == targetID {
@@ -858,9 +880,9 @@ func (f *FieldCodec) DecodeByID(targetID uint8, b []byte) (interface{}, error) {
 }
 
 // DecodeFields decodes a byte slice into a set of field ids and values.
-func (f *FieldCodec) DecodeFields(b []byte) map[uint8]interface{} {
+func (f *FieldCodec) DecodeFields(b []byte) (map[uint8]interface{}, error) {
 	if len(b) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	// Create a map to hold the decoded data.
@@ -876,7 +898,8 @@ func (f *FieldCodec) DecodeFields(b []byte) map[uint8]interface{} {
 		fieldID := b[0]
 		field := f.fieldsByID[fieldID]
 		if field == nil {
-			panic(fmt.Sprintf("field ID %d has no mapping", fieldID))
+			// See note in DecodeByID() regarding field-mapping failures.
+			return nil, ErrFieldUnmappedID
 		}
 
 		var value interface{}
@@ -899,19 +922,22 @@ func (f *FieldCodec) DecodeFields(b []byte) map[uint8]interface{} {
 			// Move bytes forward.
 			b = b[size+3:]
 		default:
-			panic(fmt.Sprintf("unsupported value type: %T", f.fieldsByID[fieldID]))
+			panic(fmt.Sprintf("unsupported value type during decode fields: %T", f.fieldsByID[fieldID]))
 		}
 
 		values[fieldID] = value
 
 	}
 
-	return values
+	return values, nil
 }
 
 // DecodeFieldsWithNames decodes a byte slice into a set of field names and values
-func (f *FieldCodec) DecodeFieldsWithNames(b []byte) map[string]interface{} {
-	fields := f.DecodeFields(b)
+func (f *FieldCodec) DecodeFieldsWithNames(b []byte) (map[string]interface{}, error) {
+	fields, err := f.DecodeFields(b)
+	if err != nil {
+		return nil, err
+	}
 	m := make(map[string]interface{})
 	for id, v := range fields {
 		field := f.fieldsByID[id]
@@ -919,7 +945,7 @@ func (f *FieldCodec) DecodeFieldsWithNames(b []byte) map[string]interface{} {
 			m[field.Name] = v
 		}
 	}
-	return m
+	return m, nil
 }
 
 // FieldByName returns the field by its name. It will return a nil if not found
@@ -1308,18 +1334,37 @@ func (db *database) continuousQueryByName(name string) *ContinuousQuery {
 
 // used to convert the tag set to bytes for use as a lookup key
 func marshalTags(tags map[string]string) []byte {
-	s := make([]string, 0, len(tags))
-	// pull out keys to sort
-	for k := range tags {
-		s = append(s, k)
+	// Empty maps marshal to empty bytes.
+	if len(tags) == 0 {
+		return nil
 	}
-	sort.Strings(s)
 
-	// now append on the key values in key sorted order
-	for _, k := range s {
-		s = append(s, tags[k])
+	// Extract keys and determine final size.
+	sz := (len(tags) * 2) - 1 // separators
+	keys := make([]string, 0, len(tags))
+	for k, v := range tags {
+		keys = append(keys, k)
+		sz += len(k) + len(v)
 	}
-	return []byte(strings.Join(s, "|"))
+	sort.Strings(keys)
+
+	// Generate marshaled bytes.
+	b := make([]byte, sz)
+	buf := b
+	for _, k := range keys {
+		copy(buf, k)
+		buf[len(k)] = '|'
+		buf = buf[len(k)+1:]
+	}
+	for i, k := range keys {
+		v := tags[k]
+		copy(buf, v)
+		if i < len(keys)-1 {
+			buf[len(v)] = '|'
+			buf = buf[len(v)+1:]
+		}
+	}
+	return b
 }
 
 // timeBetweenInclusive returns true if t is between min and max, inclusive.
@@ -1495,7 +1540,6 @@ func (m *Measurement) tagValuesByKeyAndSeriesID(tagKeys []string, ids seriesIDs)
 		// Iterate the tag keys we're interested in and collect values
 		// from this series, if they exist.
 		for _, tagKey := range tagKeys {
-			tagKey = strings.Trim(tagKey, `"`)
 			if tagVal, ok := s.Tags[tagKey]; ok {
 				if _, ok = tagValues[tagKey]; !ok {
 					tagValues[tagKey] = newStringSet()
