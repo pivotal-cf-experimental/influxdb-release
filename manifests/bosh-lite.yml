@@ -12,16 +12,17 @@ jobs:
 - name: influxdb
   templates:
   - {name: influxdb, release: influxdb}
-  instances: 1
+  instances: 3
   resource_pool: default
   persistent_disk: 10024
   networks:
   - name: warden-net
-    static_ips:  [10.244.7.6]
+    static_ips:  [10.244.7.6, 10.244.7.10, 10.244.7.14]
 
 properties:
   influxdb:
-    ips: [10.244.7.6]
+    database: test
+    ips: [10.244.7.6, 10.244.7.10, 10.244.7.14]
 
 networks:
 - name: warden-net
@@ -448,7 +449,7 @@ resource_pools:
     name: random
   name: default
   network: warden-net
-  size: 1
+  size: 3
   stemcell:
     name: bosh-warden-boshlite-ubuntu-trusty-go_agent
     version: latest

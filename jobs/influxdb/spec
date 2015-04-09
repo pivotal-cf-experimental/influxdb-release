@@ -23,5 +23,5 @@ properties:
     default: "14d"
     description: "default retention period for database"
   influxdb.replication:
-    default: "1"
+    default: "3"
     description: "default replication count for database"

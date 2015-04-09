@@ -11,8 +11,16 @@ reporting-disabled = true
 
 # Controls certain parameters that only take effect until an initial successful
 # start-up has occurred.
+
+<%
+   join_url = ''
+   if spec.index != 0
+    join_url = "http://#{p('influxdb.ips')[0]}:8086"
+   end
+%>
+
 [initialization]
-join-urls = ""
+join-urls = "<%= join_url %>"
 
 # Control authentication
 [authentication]
@@ -84,7 +92,7 @@ port = 8086
 # Where the broker logs are stored. The user running InfluxDB will need read/write access.
 dir  = "/var/vcap/store/influxdb/broker"
 
-# election-timeout = "2s"
+election-timeout = "5s"
 
 [data]
 dir = "/var/vcap/store/influxdb/db"
