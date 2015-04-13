@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
-	"math"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -14,13 +14,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/influxdb/influxdb"
-	"github.com/influxdb/influxdb/messaging"
-	"github.com/influxdb/influxdb/raft"
 
 	"github.com/influxdb/influxdb/client"
 	main "github.com/influxdb/influxdb/cmd/influxd"
@@ -32,7 +27,7 @@ const (
 	batchSize = 4217
 )
 
-type writeFn func(t *testing.T, node *Node, database, retention string)
+type writeFn func(t *testing.T, node *TestNode, database, retention string)
 
 // tempfile returns a temporary path.
 func tempfile() string {
@@ -58,34 +53,20 @@ func rewriteDbRp(old, database, retention string) string {
 }
 
 // Node represents a node under test, which is both a broker and data node.
-type Node struct {
-	broker *messaging.Broker
-	server *influxdb.Server
-	log    *raft.Log
+type TestNode struct {
+	node   *main.Node
 	url    *url.URL
 	leader bool
 }
 
 // Cluster represents a multi-node cluster.
-type Cluster []*Node
+type Cluster []*TestNode
 
 func (c *Cluster) Close() {
 	for _, n := range *c {
-		if n.log != nil {
-			n.log.Close()
-			n.log = nil
+		if err := n.node.Close(); err != nil {
+			log.Fatalf("failed to close node: %s", err)
 		}
-
-		if n.server != nil {
-			n.server.Close()
-			n.server = nil
-		}
-
-		if n.broker != nil {
-			n.broker.Close()
-			n.broker = nil
-		}
-
 	}
 }
 
@@ -94,13 +75,14 @@ func (c *Cluster) Close() {
 // the testing is marked as failed.
 //
 // This function returns a slice of nodes, the first of which will be the leader.
-func createCombinedNodeCluster(t *testing.T, testName, tmpDir string, nNodes, basePort int, baseConfig *main.Config) Cluster {
+func createCombinedNodeCluster(t *testing.T, testName, tmpDir string, nNodes int, baseConfig *main.Config) Cluster {
+	basePort := 8086
 	t.Logf("Creating cluster of %d nodes for test %s", nNodes, testName)
 	if nNodes < 1 {
 		t.Fatalf("Test %s: asked to create nonsense cluster", testName)
 	}
 
-	nodes := make([]*Node, 0)
+	nodes := make([]*TestNode, 0)
 
 	tmpBrokerDir := filepath.Join(tmpDir, "broker-integration-test")
 	tmpDataDir := filepath.Join(tmpDir, "data-integration-test")
@@ -125,17 +107,18 @@ func createCombinedNodeCluster(t *testing.T, testName, tmpDir string, nNodes, ba
 	c.Snapshot.Enabled = false
 
 	cmd := main.NewRunCommand()
-	b, s, l := cmd.Open(c, "")
+	node := cmd.Open(c, "")
+	b := node.Broker
+	s := node.DataNode
+
 	if b == nil {
 		t.Fatalf("Test %s: failed to create broker on port %d", testName, basePort)
 	}
 	if s == nil {
 		t.Fatalf("Test %s: failed to create leader data node on port %d", testName, basePort)
 	}
-	nodes = append(nodes, &Node{
-		broker: b,
-		server: s,
-		log:    l,
+	nodes = append(nodes, &TestNode{
+		node:   node,
 		url:    &url.URL{Scheme: "http", Host: "localhost:" + strconv.Itoa(basePort)},
 		leader: true,
 	})
@@ -148,19 +131,17 @@ func createCombinedNodeCluster(t *testing.T, testName, tmpDir string, nNodes, ba
 		c.Port = nextPort
 
 		cmd := main.NewRunCommand()
-		b, s, l := cmd.Open(c, "http://localhost:"+strconv.Itoa(basePort))
-		if b == nil {
+		node := cmd.Open(c, "http://localhost:"+strconv.Itoa(basePort))
+		if node.Broker == nil {
 			t.Fatalf("Test %s: failed to create following broker on port %d", testName, nextPort)
 		}
-		if s == nil {
+		if node.DataNode == nil {
 			t.Fatalf("Test %s: failed to create following data node on port %d", testName, nextPort)
 		}
 
-		nodes = append(nodes, &Node{
-			broker: b,
-			server: s,
-			log:    l,
-			url:    &url.URL{Scheme: "http", Host: "localhost:" + strconv.Itoa(nextPort)},
+		nodes = append(nodes, &TestNode{
+			node: node,
+			url:  &url.URL{Scheme: "http", Host: "localhost:" + strconv.Itoa(nextPort)},
 		})
 	}
 
@@ -175,9 +156,9 @@ func createDatabase(t *testing.T, testName string, nodes Cluster, database strin
 
 // createRetentionPolicy creates a retetention policy and verifies that the creation was successful.
 // Replication factor is set to equal the number nodes in the cluster.
-func createRetentionPolicy(t *testing.T, testName string, nodes Cluster, database, retention string) {
+func createRetentionPolicy(t *testing.T, testName string, nodes Cluster, database, retention string, replicationFactor int) {
 	t.Logf("Creating retention policy %s for database %s", retention, database)
-	command := fmt.Sprintf("CREATE RETENTION POLICY %s ON %s DURATION 1h REPLICATION %d DEFAULT", retention, database, len(nodes))
+	command := fmt.Sprintf("CREATE RETENTION POLICY %s ON %s DURATION 1h REPLICATION %d DEFAULT", retention, database, replicationFactor)
 	query(t, nodes[:1], "", command, `{"results":[{}]}`, "")
 }
 
@@ -188,7 +169,7 @@ func deleteDatabase(t *testing.T, testName string, nodes Cluster, database strin
 }
 
 // writes writes the provided data to the cluster. It verfies that a 200 OK is returned by the server.
-func write(t *testing.T, node *Node, data string) {
+func write(t *testing.T, node *TestNode, data string) {
 	u := urlFor(node.url, "write", url.Values{})
 
 	resp, err := http.Post(u.String(), "application/json", bytes.NewReader([]byte(data)))
@@ -248,49 +229,41 @@ func queryAndWait(t *testing.T, nodes Cluster, urlDb, q, expected, expectPattern
 		v.Set("db", urlDb)
 	}
 
-	var (
-		timedOut int32
-		timer    = time.NewTimer(time.Duration(math.MaxInt64))
-	)
-	defer timer.Stop()
-
-	// Check to see if they set the env for duration sleep
 	sleep := 10 * time.Millisecond
-	if d, e := time.ParseDuration(os.Getenv("TEST_SLEEP")); e == nil {
+	// Check to see if they set the env for duration sleep
+	if sleepRaw := os.Getenv("TEST_SLEEP"); sleepRaw != "" {
+		d, err := time.ParseDuration(sleepRaw)
+		if err != nil {
+			t.Fatal("Invalid TEST_SLEEP value:", err)
+		}
 		// this will limit the http log noise in the test output
 		sleep = d
 		timeout = d + 1
 	}
 
-	done := make(chan struct{})
+	var done <-chan time.Time
 	if timeout > 0 {
-		timer.Reset(time.Duration(timeout))
-		go func() {
-			select {
-			case <-done:
-				return
-			case <-timer.C:
-				atomic.StoreInt32(&timedOut, 1)
-			}
-		}()
+		timer := time.NewTimer(timeout)
+		done = timer.C
+		defer timer.Stop()
 	}
 
 	for {
-		if got, ok := query(t, nodes, urlDb, q, expected, expectPattern); ok {
-			close(done)
+		got, ok := query(t, nodes, urlDb, q, expected, expectPattern)
+		if ok {
 			return got, ok
-		} else if atomic.LoadInt32(&timedOut) == 1 {
-			close(done)
+		}
+		select {
+		case <-done:
 			return got, false
-		} else {
-			time.Sleep(sleep)
+		case <-time.After(sleep):
 		}
 	}
 }
 
 // mergeMany ensures that when merging many series together and some of them have a different number
 // of points than others in a group by interval the results are correct
-var mergeMany = func(t *testing.T, node *Node, database, retention string) {
+var mergeMany = func(t *testing.T, node *TestNode, database, retention string) {
 	for i := 1; i < 11; i++ {
 		for j := 1; j < 5+i%3; j++ {
 			data := fmt.Sprintf(`{"database": "%s", "retentionPolicy": "%s", "points": [{"name": "cpu", "timestamp": "%s", "tags": {"host": "server_%d"}, "fields": {"value": 22}}]}`,
@@ -300,7 +273,7 @@ var mergeMany = func(t *testing.T, node *Node, database, retention string) {
 	}
 }
 
-var limitAndOffset = func(t *testing.T, node *Node, database, retention string) {
+var limitAndOffset = func(t *testing.T, node *TestNode, database, retention string) {
 	for i := 1; i < 10; i++ {
 		data := fmt.Sprintf(`{"database": "%s", "retentionPolicy": "%s", "points": [{"name": "cpu", "timestamp": "%s", "tags": {"region": "us-east", "host": "server-%d"}, "fields": {"value": %d}}]}`,
 			database, retention, time.Unix(int64(i), int64(0)).Format(time.RFC3339), i, i)
@@ -308,12 +281,16 @@ var limitAndOffset = func(t *testing.T, node *Node, database, retention string) 
 	}
 }
 
-func runTest_rawDataReturnsInOrder(t *testing.T, testName string, nodes Cluster, database, retention string) {
+func runTest_rawDataReturnsInOrder(t *testing.T, testName string, nodes Cluster, database, retention string, replicationFactor int) {
+	// skip this test if they're just looking to run some of thd data tests
+	if os.Getenv("TEST_PREFIX") != "" {
+		return
+	}
 	t.Logf("Running %s:rawDataReturnsInOrder against %d-node cluster", testName, len(nodes))
 
 	// Start by ensuring database and retention policy exist.
 	createDatabase(t, testName, nodes, database)
-	createRetentionPolicy(t, testName, nodes, database, retention)
+	createRetentionPolicy(t, testName, nodes, database, retention, replicationFactor)
 	numPoints := 500
 	var expected string
 
@@ -324,7 +301,7 @@ func runTest_rawDataReturnsInOrder(t *testing.T, testName string, nodes Cluster,
 	}
 
 	expected = fmt.Sprintf(`{"results":[{"series":[{"name":"cpu","columns":["time","count"],"values":[["1970-01-01T00:00:00Z",%d]]}]}]}`, numPoints-1)
-	got, ok := queryAndWait(t, nodes, database, `SELECT count(value) FROM cpu`, expected, "", 60*time.Second)
+	got, ok := queryAndWait(t, nodes, database, `SELECT count(value) FROM cpu`, expected, "", 120*time.Second)
 	if !ok {
 		t.Errorf("test %s:rawDataReturnsInOrder failed, SELECT count() query returned unexpected data\nexp: %s\n, got: %s", testName, expected, got)
 	}
@@ -374,7 +351,7 @@ func runTests_Errors(t *testing.T, nodes Cluster) {
 }
 
 // runTests tests write and query of data. Setting testNumbers allows only a subset of tests to be run.
-func runTestsData(t *testing.T, testName string, nodes Cluster, database, retention string) {
+func runTestsData(t *testing.T, testName string, nodes Cluster, database, retention string, replicationFactor int) {
 	t.Logf("Running tests against %d-node cluster", len(nodes))
 
 	yesterday := time.Now().Add(-1 * time.Hour * 24).UTC()
@@ -382,7 +359,7 @@ func runTestsData(t *testing.T, testName string, nodes Cluster, database, retent
 
 	// Start by ensuring database and retention policy exist.
 	createDatabase(t, testName, nodes, database)
-	createRetentionPolicy(t, testName, nodes, database, retention)
+	createRetentionPolicy(t, testName, nodes, database, retention, replicationFactor)
 
 	// The tests. Within these tests %DB% and %RP% will be replaced with the database and retention passed into
 	// this function.
@@ -585,7 +562,7 @@ func runTestsData(t *testing.T, testName string, nodes Cluster, database, retent
 				{"name": "load", "timestamp": "2000-01-01T00:00:10Z", "tags": {"region": "us-east", "host": "serverB"}, "fields": {"value": 30}},
 				{"name": "load", "timestamp": "2000-01-01T00:00:00Z", "tags": {"region": "us-west", "host": "serverC"}, "fields": {"value": 100}}
 			]}`,
-			query:    `SELECT sum(value) FROM load GROUP BY time(10s), region, host`,
+			query:    `SELECT sum(value) FROM load GROUP BY region, host`,
 			queryDb:  "%DB%",
 			expected: `{"results":[{"series":[{"name":"load","tags":{"host":"serverA","region":"us-east"},"columns":["time","sum"],"values":[["1970-01-01T00:00:00Z",20]]},{"name":"load","tags":{"host":"serverB","region":"us-east"},"columns":["time","sum"],"values":[["1970-01-01T00:00:00Z",30]]},{"name":"load","tags":{"host":"serverC","region":"us-west"},"columns":["time","sum"],"values":[["1970-01-01T00:00:00Z",100]]}]}]}`,
 		},
@@ -652,9 +629,9 @@ func runTestsData(t *testing.T, testName string, nodes Cluster, database, retent
 		},
 		{
 			name:     "wildcard GROUP BY queries with time",
-			query:    `SELECT mean(value) FROM cpu GROUP BY *,time(1m)`,
+			query:    `SELECT mean(value) FROM cpu WHERE time >= '2000-01-01T00:00:00Z' AND time < '2000-01-01T00:01:00Z' GROUP BY *,time(1m)`,
 			queryDb:  "%DB%",
-			expected: `{"results":[{"series":[{"name":"cpu","tags":{"region":"us-east"},"columns":["time","mean"],"values":[["1970-01-01T00:00:00Z",15]]},{"name":"cpu","tags":{"region":"us-west"},"columns":["time","mean"],"values":[["1970-01-01T00:00:00Z",30]]}]}]}`,
+			expected: `{"results":[{"series":[{"name":"cpu","tags":{"region":"us-east"},"columns":["time","mean"],"values":[["2000-01-01T00:00:00Z",15]]},{"name":"cpu","tags":{"region":"us-west"},"columns":["time","mean"],"values":[["2000-01-01T00:00:00Z",30]]}]}]}`,
 		},
 
 		// WHERE tag queries
@@ -1184,6 +1161,17 @@ func runTestsData(t *testing.T, testName string, nodes Cluster, database, retent
 			expected: `{"results":[{}]}`,
 		},
 		{
+			name:     "Ensure default retention policy can be changed",
+			query:    `ALTER RETENTION POLICY rp1 ON mydatabase DEFAULT`,
+			queryOne: true,
+			expected: `{"results":[{}]}`,
+		},
+		{
+			name:     "Make sure default retention policy actually changed",
+			query:    `SHOW RETENTION POLICIES mydatabase`,
+			expected: `{"results":[{"series":[{"columns":["name","duration","replicaN","default"],"values":[["default","0",1,false],["rp1","0",1,true]]}]}]}`,
+		},
+		{
 			name:     "Ensure retention policy with acceptable retention can be created",
 			query:    `CREATE RETENTION POLICY rp2 ON mydatabase DURATION 30d REPLICATION 1`,
 			queryOne: true,
@@ -1334,7 +1322,7 @@ func runTestsData(t *testing.T, testName string, nodes Cluster, database, retent
 			t.Logf(`reseting for test "%s"`, name)
 			deleteDatabase(t, testName, nodes, database)
 			createDatabase(t, testName, nodes, database)
-			createRetentionPolicy(t, testName, nodes, database, retention)
+			createRetentionPolicy(t, testName, nodes, database, retention, replicationFactor)
 		}
 
 		if tt.write != "" {
@@ -1378,11 +1366,11 @@ func TestSingleServer(t *testing.T) {
 		os.RemoveAll(dir)
 	}()
 
-	nodes := createCombinedNodeCluster(t, testName, dir, 1, 8090, nil)
+	nodes := createCombinedNodeCluster(t, testName, dir, 1, nil)
 	defer nodes.Close()
 
-	runTestsData(t, testName, nodes, "mydb", "myrp")
-	runTest_rawDataReturnsInOrder(t, testName, nodes, "mydb", "myrp")
+	runTestsData(t, testName, nodes, "mydb", "myrp", len(nodes))
+	runTest_rawDataReturnsInOrder(t, testName, nodes, "mydb", "myrp", len(nodes))
 }
 
 func Test3NodeServer(t *testing.T) {
@@ -1396,11 +1384,31 @@ func Test3NodeServer(t *testing.T) {
 		os.RemoveAll(dir)
 	}()
 
-	nodes := createCombinedNodeCluster(t, testName, dir, 3, 8190, nil)
+	nodes := createCombinedNodeCluster(t, testName, dir, 3, nil)
+	defer nodes.Close()
 
-	runTestsData(t, testName, nodes, "mydb", "myrp")
-	runTest_rawDataReturnsInOrder(t, testName, nodes, "mydb", "myrp")
+	runTestsData(t, testName, nodes, "mydb", "myrp", len(nodes))
+	runTest_rawDataReturnsInOrder(t, testName, nodes, "mydb", "myrp", len(nodes))
 
+}
+
+// ensure that all queries work if there are more nodes in a cluster than the replication factor
+func Test3NodeClusterPartiallyReplicated(t *testing.T) {
+	t.Skip("Skipping due to instability")
+	testName := "3-node server integration partial replication"
+	if testing.Short() {
+		t.Skip(fmt.Sprintf("skipping '%s'", testName))
+	}
+	dir := tempfile()
+	defer func() {
+		os.RemoveAll(dir)
+	}()
+
+	nodes := createCombinedNodeCluster(t, testName, dir, 3, nil)
+	defer nodes.Close()
+
+	runTestsData(t, testName, nodes, "mydb", "myrp", len(nodes)-1)
+	runTest_rawDataReturnsInOrder(t, testName, nodes, "mydb", "myrp", len(nodes)-1)
 }
 
 func TestClientLibrary(t *testing.T) {
@@ -1415,7 +1423,9 @@ func TestClientLibrary(t *testing.T) {
 
 	now := time.Now().UTC()
 
-	nodes := createCombinedNodeCluster(t, testName, dir, 1, 8290, nil)
+	nodes := createCombinedNodeCluster(t, testName, dir, 1, nil)
+	defer nodes.Close()
+
 	type write struct {
 		bp       client.BatchPoints
 		expected string
@@ -1502,7 +1512,7 @@ func TestClientLibrary(t *testing.T) {
 			test.rp = "myrp"
 		}
 		createDatabase(t, testName, nodes, test.db)
-		createRetentionPolicy(t, testName, nodes, test.db, test.rp)
+		createRetentionPolicy(t, testName, nodes, test.db, test.rp, len(nodes))
 		t.Logf("testing %s - %s\n", testName, test.name)
 		for _, w := range test.writes {
 			writeResult, err := c.Write(w.bp)
@@ -1541,7 +1551,6 @@ func Test_ServerSingleGraphiteIntegration(t *testing.T) {
 		t.Skip()
 	}
 	nNodes := 1
-	basePort := 8390
 	testName := "graphite integration"
 	dir := tempfile()
 	now := time.Now().UTC().Round(time.Second)
@@ -1554,10 +1563,11 @@ func Test_ServerSingleGraphiteIntegration(t *testing.T) {
 	c.Graphites = append(c.Graphites, g)
 
 	t.Logf("Graphite Connection String: %s\n", g.ConnectionString(c.BindAddress))
-	nodes := createCombinedNodeCluster(t, testName, dir, nNodes, basePort, c)
+	nodes := createCombinedNodeCluster(t, testName, dir, nNodes, c)
+	defer nodes.Close()
 
 	createDatabase(t, testName, nodes, "graphite")
-	createRetentionPolicy(t, testName, nodes, "graphite", "raw")
+	createRetentionPolicy(t, testName, nodes, "graphite", "raw", len(nodes))
 
 	// Connect to the graphite endpoint we just spun up
 	conn, err := net.Dial("tcp", g.ConnectionString(c.BindAddress))
@@ -1591,7 +1601,6 @@ func Test_ServerSingleGraphiteIntegration_FractionalTime(t *testing.T) {
 		t.Skip()
 	}
 	nNodes := 1
-	basePort := 8490
 	testName := "graphite integration fractional time"
 	dir := tempfile()
 	now := time.Now().UTC().Round(time.Second).Add(500 * time.Millisecond)
@@ -1605,10 +1614,11 @@ func Test_ServerSingleGraphiteIntegration_FractionalTime(t *testing.T) {
 	c.Graphites = append(c.Graphites, g)
 
 	t.Logf("Graphite Connection String: %s\n", g.ConnectionString(c.BindAddress))
-	nodes := createCombinedNodeCluster(t, testName, dir, nNodes, basePort, c)
+	nodes := createCombinedNodeCluster(t, testName, dir, nNodes, c)
+	defer nodes.Close()
 
 	createDatabase(t, testName, nodes, "graphite")
-	createRetentionPolicy(t, testName, nodes, "graphite", "raw")
+	createRetentionPolicy(t, testName, nodes, "graphite", "raw", len(nodes))
 
 	// Connect to the graphite endpoint we just spun up
 	conn, err := net.Dial("tcp", g.ConnectionString(c.BindAddress))
@@ -1643,7 +1653,6 @@ func Test_ServerSingleGraphiteIntegration_ZeroDataPoint(t *testing.T) {
 		t.Skip()
 	}
 	nNodes := 1
-	basePort := 8590
 	testName := "graphite integration"
 	dir := tempfile()
 	now := time.Now().UTC().Round(time.Second)
@@ -1657,10 +1666,11 @@ func Test_ServerSingleGraphiteIntegration_ZeroDataPoint(t *testing.T) {
 	c.Graphites = append(c.Graphites, g)
 
 	t.Logf("Graphite Connection String: %s\n", g.ConnectionString(c.BindAddress))
-	nodes := createCombinedNodeCluster(t, testName, dir, nNodes, basePort, c)
+	nodes := createCombinedNodeCluster(t, testName, dir, nNodes, c)
+	defer nodes.Close()
 
 	createDatabase(t, testName, nodes, "graphite")
-	createRetentionPolicy(t, testName, nodes, "graphite", "raw")
+	createRetentionPolicy(t, testName, nodes, "graphite", "raw", len(nodes))
 
 	// Connect to the graphite endpoint we just spun up
 	conn, err := net.Dial("tcp", g.ConnectionString(c.BindAddress))
@@ -1694,7 +1704,6 @@ func Test_ServerSingleGraphiteIntegration_NoDatabase(t *testing.T) {
 		t.Skip()
 	}
 	nNodes := 1
-	basePort := 8690
 	testName := "graphite integration"
 	dir := tempfile()
 	now := time.Now().UTC().Round(time.Second)
@@ -1707,7 +1716,8 @@ func Test_ServerSingleGraphiteIntegration_NoDatabase(t *testing.T) {
 	c.Graphites = append(c.Graphites, g)
 	c.Logging.WriteTracing = true
 	t.Logf("Graphite Connection String: %s\n", g.ConnectionString(c.BindAddress))
-	nodes := createCombinedNodeCluster(t, testName, dir, nNodes, basePort, c)
+	nodes := createCombinedNodeCluster(t, testName, dir, nNodes, c)
+	defer nodes.Close()
 
 	// Connect to the graphite endpoint we just spun up
 	conn, err := net.Dial("tcp", g.ConnectionString(c.BindAddress))
@@ -1754,7 +1764,6 @@ func Test_ServerOpenTSDBIntegration(t *testing.T) {
 		t.Skip()
 	}
 	nNodes := 1
-	basePort := 8790
 	testName := "opentsdb integration"
 	dir := tempfile()
 	now := time.Now().UTC().Round(time.Second)
@@ -1768,10 +1777,11 @@ func Test_ServerOpenTSDBIntegration(t *testing.T) {
 	c.OpenTSDB = o
 
 	t.Logf("OpenTSDB Connection String: %s\n", o.ListenAddress(c.BindAddress))
-	nodes := createCombinedNodeCluster(t, testName, dir, nNodes, basePort, c)
+	nodes := createCombinedNodeCluster(t, testName, dir, nNodes, c)
+	defer nodes.Close()
 
 	createDatabase(t, testName, nodes, "opentsdb")
-	createRetentionPolicy(t, testName, nodes, "opentsdb", "raw")
+	createRetentionPolicy(t, testName, nodes, "opentsdb", "raw", len(nodes))
 
 	// Connect to the graphite endpoint we just spun up
 	conn, err := net.Dial("tcp", o.ListenAddress(c.BindAddress))
@@ -1805,7 +1815,6 @@ func Test_ServerOpenTSDBIntegration_WithTags(t *testing.T) {
 		t.Skip()
 	}
 	nNodes := 1
-	basePort := 8791
 	testName := "opentsdb integration"
 	dir := tempfile()
 	now := time.Now().UTC().Round(time.Second)
@@ -1819,10 +1828,11 @@ func Test_ServerOpenTSDBIntegration_WithTags(t *testing.T) {
 	c.OpenTSDB = o
 
 	t.Logf("OpenTSDB Connection String: %s\n", o.ListenAddress(c.BindAddress))
-	nodes := createCombinedNodeCluster(t, testName, dir, nNodes, basePort, c)
+	nodes := createCombinedNodeCluster(t, testName, dir, nNodes, c)
+	defer nodes.Close()
 
 	createDatabase(t, testName, nodes, "opentsdb")
-	createRetentionPolicy(t, testName, nodes, "opentsdb", "raw")
+	createRetentionPolicy(t, testName, nodes, "opentsdb", "raw", len(nodes))
 
 	// Connect to the graphite endpoint we just spun up
 	conn, err := net.Dial("tcp", o.ListenAddress(c.BindAddress))
@@ -1859,7 +1869,6 @@ func Test_ServerOpenTSDBIntegration_BadData(t *testing.T) {
 		t.Skip()
 	}
 	nNodes := 1
-	basePort := 8792
 	testName := "opentsdb integration"
 	dir := tempfile()
 	now := time.Now().UTC().Round(time.Second)
@@ -1873,10 +1882,11 @@ func Test_ServerOpenTSDBIntegration_BadData(t *testing.T) {
 	c.OpenTSDB = o
 
 	t.Logf("OpenTSDB Connection String: %s\n", o.ListenAddress(c.BindAddress))
-	nodes := createCombinedNodeCluster(t, testName, dir, nNodes, basePort, c)
+	nodes := createCombinedNodeCluster(t, testName, dir, nNodes, c)
+	defer nodes.Close()
 
 	createDatabase(t, testName, nodes, "opentsdb")
-	createRetentionPolicy(t, testName, nodes, "opentsdb", "raw")
+	createRetentionPolicy(t, testName, nodes, "opentsdb", "raw", len(nodes))
 
 	// Connect to the graphite endpoint we just spun up
 	conn, err := net.Dial("tcp", o.ListenAddress(c.BindAddress))
@@ -1925,31 +1935,32 @@ func TestSeparateBrokerDataNode(t *testing.T) {
 
 	brokerConfig := main.NewConfig()
 	brokerConfig.Data.Enabled = false
-	brokerConfig.Port = 9000
 	brokerConfig.Broker.Dir = filepath.Join(tmpBrokerDir, strconv.Itoa(brokerConfig.Port))
 	brokerConfig.ReportingDisabled = true
 
 	dataConfig := main.NewConfig()
-	dataConfig.Port = 9001
+	dataConfig.Port = 9086
 	dataConfig.Broker.Enabled = false
 	dataConfig.Data.Dir = filepath.Join(tmpDataDir, strconv.Itoa(dataConfig.Port))
 	dataConfig.ReportingDisabled = true
 
 	brokerCmd := main.NewRunCommand()
-	b, _, _ := brokerCmd.Open(brokerConfig, "")
-	if b == nil {
+	broker := brokerCmd.Open(brokerConfig, "")
+	defer broker.Close()
+
+	if broker.Broker == nil {
 		t.Fatalf("Test %s: failed to create broker on port %d", testName, brokerConfig.Port)
 	}
 
-	u := b.URL()
+	u := broker.Broker.URL()
 	dataCmd := main.NewRunCommand()
 
-	_, s, _ := dataCmd.Open(dataConfig, (&u).String())
-	if s == nil {
+	data := dataCmd.Open(dataConfig, (&u).String())
+	defer data.Close()
+
+	if data.DataNode == nil {
 		t.Fatalf("Test %s: failed to create leader data node on port %d", testName, dataConfig.Port)
 	}
-	brokerCmd.Close()
-	dataCmd.Close()
 }
 
 func TestSeparateBrokerTwoDataNodes(t *testing.T) {
@@ -1972,51 +1983,51 @@ func TestSeparateBrokerTwoDataNodes(t *testing.T) {
 	// Start a single broker node
 	brokerConfig := main.NewConfig()
 	brokerConfig.Data.Enabled = false
-	brokerConfig.Port = 9010
 	brokerConfig.Broker.Dir = filepath.Join(tmpBrokerDir, strconv.Itoa(brokerConfig.Port))
 	brokerConfig.ReportingDisabled = true
 
 	brokerCmd := main.NewRunCommand()
-	b, _, _ := brokerCmd.Open(brokerConfig, "")
-	if b == nil {
+	broker := brokerCmd.Open(brokerConfig, "")
+	defer broker.Close()
+
+	if broker.Broker == nil {
 		t.Fatalf("Test %s: failed to create broker on port %d", testName, brokerConfig.Port)
 	}
 
-	u := b.URL()
+	u := broker.Broker.URL()
 	brokerURL := (&u).String()
 
 	// Star the first data node and join the broker
 	dataConfig1 := main.NewConfig()
-	dataConfig1.Port = 9011
+	dataConfig1.Port = 9086
 	dataConfig1.Broker.Enabled = false
 	dataConfig1.Data.Dir = filepath.Join(tmpDataDir, strconv.Itoa(dataConfig1.Port))
 	dataConfig1.ReportingDisabled = true
 
 	dataCmd1 := main.NewRunCommand()
 
-	_, s1, _ := dataCmd1.Open(dataConfig1, brokerURL)
-	if s1 == nil {
+	data1 := dataCmd1.Open(dataConfig1, brokerURL)
+	defer data1.Close()
+
+	if data1.DataNode == nil {
 		t.Fatalf("Test %s: failed to create leader data node on port %d", testName, dataConfig1.Port)
 	}
 
 	// Join data node 2 to single broker and first data node
 	dataConfig2 := main.NewConfig()
-	dataConfig2.Port = 9012
+	dataConfig2.Port = 10086
 	dataConfig2.Broker.Enabled = false
 	dataConfig2.Data.Dir = filepath.Join(tmpDataDir, strconv.Itoa(dataConfig2.Port))
 	dataConfig2.ReportingDisabled = true
 
 	dataCmd2 := main.NewRunCommand()
 
-	_, s2, _ := dataCmd2.Open(dataConfig2, brokerURL)
-	if s2 == nil {
+	data2 := dataCmd2.Open(dataConfig2, brokerURL)
+
+	defer data2.Close()
+	if data2.DataNode == nil {
 		t.Fatalf("Test %s: failed to create leader data node on port %d", testName, dataConfig2.Port)
 	}
-
-	brokerCmd.Close()
-	dataCmd1.Close()
-	dataCmd2.Close()
-
 }
 
 // helper funcs

@@ -17,8 +17,10 @@ type DataType string
 const (
 	// Unknown primitive data type.
 	Unknown = DataType("")
-	// Number means the data type is an int or float.
-	Number = DataType("number")
+	// Float means the data type is a float
+	Float = DataType("float")
+	// Integer means the data type is a integer
+	Integer = DataType("integer")
 	// Boolean means the data type is a boolean.
 	Boolean = DataType("boolean")
 	// String means the data type is a string of text.
@@ -33,9 +35,9 @@ const (
 func InspectDataType(v interface{}) DataType {
 	switch v.(type) {
 	case float64:
-		return Number
-	case int:
-		return Number
+		return Float
+	case int64, int32, int:
+		return Integer
 	case bool:
 		return Boolean
 	case string:
@@ -1196,7 +1198,7 @@ func (s *ShowSeriesStatement) RequiredPrivileges() ExecutionPrivileges {
 // DropSeriesStatement represents a command for removing a series from the database.
 type DropSeriesStatement struct {
 	// The Id of the series being dropped (optional)
-	SeriesID uint32
+	SeriesID uint64
 
 	// Data source that fields are extracted from (optional)
 	Source Source

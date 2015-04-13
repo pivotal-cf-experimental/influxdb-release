@@ -1,8 +1,23 @@
-## v0.9.0-rc23 [Unreleased]
+## v0.9.0-rc24 [unreleased]
+
+### Features
+
+### Bugfixes
+- [#2255](https://github.com/influxdb/influxdb/pull/2255): Fix panic when changing default retention policy.
+- [#2261](https://github.com/influxdb/influxdb/pull/2261): Support int64 value types.
+- [#2191](https://github.com/influxdb/influxdb/pull/2191): Case-insensitive check for "fill"
+
+## v0.9.0-rc23 [2015-04-11]
+
+### Features
+- [#2202](https://github.com/influxdb/influxdb/pull/2202): Initial implementation of Distributed Queries
+- [#2202](https://github.com/influxdb/influxdb/pull/2202): 64-bit Series IDs. INCOMPATIBLE WITH PREVIOUS DATASTORES.
 
 ### Bugfixes
 - [#2225](https://github.com/influxdb/influxdb/pull/2225): Make keywords completely case insensitive
 - [#2228](https://github.com/influxdb/influxdb/pull/2228): Accept keyword default unquoted in ALTER RETENTION POLICY statement
+- [#2236](https://github.com/influxdb/influxdb/pull/2236): Immediate term changes, fix stale write issue, net/http/pprof 
+- [#2213](https://github.com/influxdb/influxdb/pull/2213): Seed random number generator for election timeout. Thanks @cannium.
 
 ## v0.9.0-rc22 [2015-04-09]
 
