@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/influxdb/influxdb/messaging"
@@ -27,7 +28,9 @@ const (
 
 // Broker represents an InfluxDB specific messaging broker.
 type Broker struct {
+	mu sync.RWMutex
 	*messaging.Broker
+	client *http.Client
 
 	done chan struct{}
 
@@ -40,7 +43,11 @@ type Broker struct {
 // NewBroker returns a new instance of a Broker with default values.
 func NewBroker() *Broker {
 	return &Broker{
-		Broker:              messaging.NewBroker(),
+		Broker: messaging.NewBroker(),
+		client: &http.Client{
+			Timeout: DefaultDataNodeTimeout,
+		},
+
 		TriggerInterval:     5 * time.Second,
 		TriggerTimeout:      20 * time.Second,
 		TriggerFailurePause: 1 * time.Second,
@@ -49,16 +56,27 @@ func NewBroker() *Broker {
 
 // RunContinuousQueryLoop starts running continuous queries on a background goroutine.
 func (b *Broker) RunContinuousQueryLoop() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	b.done = make(chan struct{})
 	go b.continuousQueryLoop(b.done)
 }
 
 // Close closes the broker.
 func (b *Broker) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	if b.done != nil {
 		close(b.done)
 		b.done = nil
 	}
+
+	// since the client doesn't specify a Transport when created,
+	// it will use the DefaultTransport.
+	http.DefaultTransport.(*http.Transport).CloseIdleConnections()
+
 	return b.Broker.Close()
 }
 
@@ -108,13 +126,12 @@ func (b *Broker) runContinuousQueries() {
 }
 
 func (b *Broker) requestContinuousQueryProcessing(cqURL url.URL) error {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 	// Send request.
-	cqURL.Path = "/process_continuous_queries"
+	cqURL.Path = "/data/process_continuous_queries"
 	cqURL.Scheme = "http"
-	client := &http.Client{
-		Timeout: DefaultDataNodeTimeout,
-	}
-	resp, err := client.Post(cqURL.String(), "application/octet-stream", nil)
+	resp, err := b.client.Post(cqURL.String(), "application/octet-stream", nil)
 	if err != nil {
 		return err
 	}

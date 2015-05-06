@@ -541,8 +541,7 @@ func TestHandler_GzipEnabled(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept-Encoding", "gzip")
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		panic(err)
 	}
@@ -567,8 +566,7 @@ func TestHandler_GzipDisabled(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept-Encoding", "")
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		panic(err)
 	}
@@ -585,7 +583,7 @@ func TestHandler_Index(t *testing.T) {
 	s := NewClusterServer(srvr)
 	defer s.Close()
 
-	status, body := MustHTTP("GET", s.URL, nil, nil, "")
+	status, body := MustHTTP("GET", s.URL+"/data", nil, nil, "")
 
 	if status != http.StatusOK {
 		t.Fatalf("unexpected status: %d", status)
@@ -603,7 +601,7 @@ func TestHandler_Wait(t *testing.T) {
 	s := NewClusterServer(srvr)
 	defer s.Close()
 
-	status, body := MustHTTP("GET", s.URL+`/wait/1`, map[string]string{"timeout": "1"}, nil, "")
+	status, body := MustHTTP("GET", s.URL+`/data/wait/1`, map[string]string{"timeout": "1"}, nil, "")
 
 	if status != http.StatusOK {
 		t.Fatalf("unexpected status: %d", status)
@@ -624,7 +622,7 @@ func TestHandler_WaitIncrement(t *testing.T) {
 	s := NewClusterServer(srvr)
 	defer s.Close()
 
-	status, _ := MustHTTP("GET", s.URL+`/wait/2`, map[string]string{"timeout": "200"}, nil, "")
+	status, _ := MustHTTP("GET", s.URL+`/data/wait/2`, map[string]string{"timeout": "200"}, nil, "")
 
 	// Write some data
 	_, _ = MustHTTP("POST", s.URL+`/write`, nil, nil, `{"database" : "foo", "retentionPolicy" : "bar", "points": [{"name": "cpu", "tags": {"host": "server01"},"timestamp": "2009-11-10T23:00:00Z","fields": {"value": 100}}]}`)
@@ -641,7 +639,7 @@ func TestHandler_WaitNoIndexSpecified(t *testing.T) {
 	s := NewClusterServer(srvr)
 	defer s.Close()
 
-	status, _ := MustHTTP("GET", s.URL+`/wait`, nil, nil, "")
+	status, _ := MustHTTP("GET", s.URL+`/data/wait`, nil, nil, "")
 
 	if status != http.StatusNotFound {
 		t.Fatalf("unexpected status, expected:  %d, actual: %d", http.StatusNotFound, status)
@@ -655,7 +653,7 @@ func TestHandler_WaitInvalidIndexSpecified(t *testing.T) {
 	s := NewClusterServer(srvr)
 	defer s.Close()
 
-	status, _ := MustHTTP("GET", s.URL+`/wait/foo`, nil, nil, "")
+	status, _ := MustHTTP("GET", s.URL+`/data/wait/foo`, nil, nil, "")
 
 	if status != http.StatusBadRequest {
 		t.Fatalf("unexpected status, expected:  %d, actual: %d", http.StatusBadRequest, status)
@@ -669,7 +667,7 @@ func TestHandler_WaitExpectTimeout(t *testing.T) {
 	s := NewClusterServer(srvr)
 	defer s.Close()
 
-	status, _ := MustHTTP("GET", s.URL+`/wait/2`, map[string]string{"timeout": "1"}, nil, "")
+	status, _ := MustHTTP("GET", s.URL+`/data/wait/2`, map[string]string{"timeout": "1"}, nil, "")
 
 	if status != http.StatusRequestTimeout {
 		t.Fatalf("unexpected status, expected:  %d, actual: %d", http.StatusRequestTimeout, status)
@@ -774,7 +772,7 @@ func TestHandler_DataNodes(t *testing.T) {
 	s := NewAPIServer(srvr)
 	defer s.Close()
 
-	status, body := MustHTTP("GET", s.URL+`/data_nodes`, nil, nil, "")
+	status, body := MustHTTP("GET", s.URL+`/data/data_nodes`, nil, nil, "")
 	if status != http.StatusOK {
 		t.Fatalf("unexpected status: %d", status)
 	} else if body != `[{"id":1,"url":"http://localhost:1000"},{"id":2,"url":"http://localhost:2000"},{"id":3,"url":"http://localhost:3000"}]` {
@@ -790,7 +788,7 @@ func TestHandler_CreateDataNode(t *testing.T) {
 	s := NewAPIServer(srvr)
 	defer s.Close()
 
-	status, body := MustHTTP("POST", s.URL+`/data_nodes`, nil, nil, `{"url":"http://localhost:1000"}`)
+	status, body := MustHTTP("POST", s.URL+`/data/data_nodes`, nil, nil, `{"url":"http://localhost:1000"}`)
 	if status != http.StatusOK {
 		t.Fatalf("unexpected status: %d", status)
 	} else if body != `{"id":1,"url":"http://localhost:1000"}` {
@@ -806,7 +804,7 @@ func TestHandler_CreateDataNode_BadRequest(t *testing.T) {
 	s := NewAPIServer(srvr)
 	defer s.Close()
 
-	status, body := MustHTTP("POST", s.URL+`/data_nodes`, nil, nil, `{"name":`)
+	status, body := MustHTTP("POST", s.URL+`/data/data_nodes`, nil, nil, `{"name":`)
 	if status != http.StatusBadRequest {
 		t.Fatalf("unexpected status: %d", status)
 	} else if body != `unexpected EOF` {
@@ -822,7 +820,7 @@ func TestHandler_CreateDataNode_InternalServerError(t *testing.T) {
 	s := NewAPIServer(srvr)
 	defer s.Close()
 
-	status, body := MustHTTP("POST", s.URL+`/data_nodes`, nil, nil, `{"url":""}`)
+	status, body := MustHTTP("POST", s.URL+`/data/data_nodes`, nil, nil, `{"url":""}`)
 	if status != http.StatusInternalServerError {
 		t.Fatalf("unexpected status: %d, %s", status, body)
 	} else if body != `data node url required` {
@@ -839,7 +837,7 @@ func TestHandler_DeleteDataNode(t *testing.T) {
 	s := NewAPIServer(srvr)
 	defer s.Close()
 
-	status, body := MustHTTP("DELETE", s.URL+`/data_nodes/1`, nil, nil, "")
+	status, body := MustHTTP("DELETE", s.URL+`/data/data_nodes/1`, nil, nil, "")
 	if status != http.StatusOK {
 		t.Fatalf("unexpected status: %d", status)
 	} else if body != `` {
@@ -855,7 +853,7 @@ func TestHandler_DeleteUser_DataNodeNotFound(t *testing.T) {
 	s := NewAPIServer(srvr)
 	defer s.Close()
 
-	status, body := MustHTTP("DELETE", s.URL+`/data_nodes/10000`, nil, nil, "")
+	status, body := MustHTTP("DELETE", s.URL+`/data/data_nodes/10000`, nil, nil, "")
 	if status != http.StatusNotFound {
 		t.Fatalf("unexpected status: %d", status)
 	} else if body != `data node not found` {
@@ -1186,6 +1184,26 @@ func TestHandler_serveWriteSeriesWithNoFields(t *testing.T) {
 	}
 }
 
+func TestHandler_serveWriteSeriesWithNullFields(t *testing.T) {
+	c := test.NewDefaultMessagingClient()
+	defer c.Close()
+	srvr := OpenAuthenticatedServer(c)
+	srvr.CreateDatabase("foo")
+	srvr.CreateRetentionPolicy("foo", influxdb.NewRetentionPolicy("bar"))
+	s := NewAPIServer(srvr)
+	defer s.Close()
+
+	status, body := MustHTTP("POST", s.URL+`/write`, nil, nil, `{"database" : "foo", "retentionPolicy" : "bar", "points": [{"name": "cpu", "fields": {"country": null}}]}`)
+
+	expected := fmt.Sprintf(`{"error":"%s"}`, influxdb.ErrFieldIsNull.Error())
+
+	if status != http.StatusInternalServerError {
+		t.Fatalf("unexpected status: %d", status)
+	} else if body != expected {
+		t.Fatalf("result mismatch:\n\texp=%s\n\tgot=%s\n", expected, body)
+	}
+}
+
 func TestHandler_serveWriteSeriesWithAuthNilUser(t *testing.T) {
 	c := test.NewDefaultMessagingClient()
 	defer c.Close()
@@ -1234,8 +1252,6 @@ func TestHandler_serveWriteSeries_errorHasJsonContentType(t *testing.T) {
 	s := NewAPIServer(srvr)
 	defer s.Close()
 
-	client := &http.Client{}
-
 	req, err := http.NewRequest("POST", s.URL+`/write`, bytes.NewBufferString("{}"))
 	if err != nil {
 		panic(err)
@@ -1244,7 +1260,7 @@ func TestHandler_serveWriteSeries_errorHasJsonContentType(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept-Encoding", "gzip")
 
-	resp, err := client.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		panic(err)
 	}
@@ -1273,8 +1289,6 @@ func TestHandler_serveWriteSeries_queryHasJsonContentType(t *testing.T) {
 
 	srvr.Restart() // Ensure data is queryable across restarts.
 
-	client := &http.Client{}
-
 	params := url.Values{}
 	params.Add("db", "foo")
 	params.Add("q", "select * from cpu")
@@ -1285,7 +1299,7 @@ func TestHandler_serveWriteSeries_queryHasJsonContentType(t *testing.T) {
 
 	req.Header.Set("Accept-Encoding", "gzip")
 
-	resp, err := client.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		panic(err)
 	}
@@ -1304,7 +1318,7 @@ func TestHandler_serveWriteSeries_queryHasJsonContentType(t *testing.T) {
 
 	req_error.Header.Set("Accept-Encoding", "gzip")
 
-	resp_error, err := client.Do(req_error)
+	resp_error, err := http.DefaultClient.Do(req_error)
 	if err != nil {
 		panic(err)
 	}
@@ -1585,7 +1599,7 @@ func TestHandler_ProcessContinousQueries(t *testing.T) {
 	s := NewClusterServer(srvr)
 	defer s.Close()
 
-	status, _ := MustHTTP("POST", s.URL+`/process_continuous_queries`, nil, nil, "")
+	status, _ := MustHTTP("POST", s.URL+`/data/process_continuous_queries`, nil, nil, "")
 	if status != http.StatusAccepted {
 		t.Fatalf("unexpected status: %d", status)
 	}
@@ -1614,7 +1628,7 @@ func TestSnapshotHandler(t *testing.T) {
 	// The "shards/1" has a higher index in the diff so it won't be included in the snapshot.
 	w := httptest.NewRecorder()
 	r, _ := http.NewRequest(
-		"GET", "http://localhost/snapshot",
+		"GET", "http://localhost/data/snapshot",
 		strings.NewReader(`{"files":[{"name":"meta","index":10},{"name":"shards/1","index":20}]}`),
 	)
 	h.ServeHTTP(w, r)
@@ -1726,8 +1740,7 @@ func MustHTTP(verb, path string, params, headers map[string]string, body string)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		panic(err)
 	}
@@ -1754,22 +1767,22 @@ type HTTPServer struct {
 }
 
 func NewAPIServer(s *Server) *HTTPServer {
-	h := httpd.NewAPIHandler(s.Server, false, "X.X")
+	h := httpd.NewAPIHandler(s.Server, false, false, "X.X")
 	return &HTTPServer{httptest.NewServer(h), h}
 }
 
 func NewClusterServer(s *Server) *HTTPServer {
-	h := httpd.NewClusterHandler(s.Server, false, "X.X")
+	h := httpd.NewClusterHandler(s.Server, false, true, false, "X.X")
 	return &HTTPServer{httptest.NewServer(h), h}
 }
 
 func NewAuthenticatedClusterServer(s *Server) *HTTPServer {
-	h := httpd.NewClusterHandler(s.Server, true, "X.X")
+	h := httpd.NewClusterHandler(s.Server, true, true, false, "X.X")
 	return &HTTPServer{httptest.NewServer(h), h}
 }
 
 func NewAuthenticatedAPIServer(s *Server) *HTTPServer {
-	h := httpd.NewAPIHandler(s.Server, true, "X.X")
+	h := httpd.NewAPIHandler(s.Server, true, false, "X.X")
 	return &HTTPServer{httptest.NewServer(h), h}
 }
 

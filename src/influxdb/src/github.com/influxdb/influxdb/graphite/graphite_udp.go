@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/influxdb/influxdb"
 )
@@ -18,8 +19,13 @@ type UDPServer struct {
 	writer   SeriesWriter
 	parser   *Parser
 	database string
+	conn     *net.UDPConn
+	addr     *net.UDPAddr
+	wg       sync.WaitGroup
 
 	Logger *log.Logger
+
+	host string
 }
 
 // NewUDPServer returns a new instance of a UDPServer
@@ -45,13 +51,19 @@ func (u *UDPServer) ListenAndServe(iface string) error {
 		return err
 	}
 
+	u.addr = addr
+
 	conn, err := net.ListenUDP("udp", addr)
 	if err != nil {
 		return err
 	}
 
+	u.host = u.addr.String()
+
 	buf := make([]byte, udpBufferSize)
+	u.wg.Add(1)
 	go func() {
+		defer u.wg.Done()
 		for {
 			n, _, err := conn.ReadFromUDP(buf)
 			if err != nil {
@@ -72,4 +84,14 @@ func (u *UDPServer) ListenAndServe(iface string) error {
 		}
 	}()
 	return nil
+}
+
+func (u *UDPServer) Host() string {
+	return u.host
+}
+
+func (u *UDPServer) Close() error {
+	err := u.Close()
+	u.wg.Done()
+	return err
 }

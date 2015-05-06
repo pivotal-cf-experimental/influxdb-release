@@ -33,6 +33,9 @@ var (
 	// ErrDataNodeURLRequired is returned when creating a data node without a URL.
 	ErrDataNodeURLRequired = errors.New("data node url required")
 
+	// ErrNoDataNodeAvailable is returned when there are no data nodes available
+	ErrNoDataNodeAvailable = errors.New("data node not available")
+
 	// ErrDataNodeExists is returned when creating a duplicate data node.
 	ErrDataNodeExists = errors.New("data node exists")
 
@@ -86,8 +89,14 @@ var (
 	// policy on a database but the default has not been set.
 	ErrDefaultRetentionPolicyNotFound = errors.New("default retention policy not found")
 
-	// ErrShardNotFound is returned writing to a non-existent shard.
+	// ErrShardNotFound is returned when attempting to access a non-existent shard
 	ErrShardNotFound = errors.New("shard not found")
+
+	// ErrShardNotLocal is returned when a server attempts to access a shard that is not local
+	ErrShardNotLocal = errors.New("shard not local")
+
+	// ErrShardShortRead returned when the number of bytes read from a shard is less than expected.
+	ErrShardShortRead = errors.New("shard read returned insufficient data")
 
 	// ErrInvalidPointBuffer is returned when a buffer containing data for writing is invalid
 	ErrInvalidPointBuffer = errors.New("invalid point buffer")
@@ -107,6 +116,9 @@ var (
 
 	// ErrFieldsRequired is returned when a point does not any fields.
 	ErrFieldsRequired = errors.New("fields required")
+
+	// FieldIsNull is returned when one of a point's field is null.
+	ErrFieldIsNull = errors.New("field value is null")
 
 	// ErrFieldOverflow is returned when too many fields are created on a measurement.
 	ErrFieldOverflow = errors.New("field overflow")
@@ -140,9 +152,6 @@ var (
 
 	// ErrContinuousQueryNotFound is returned when dropping a nonexistent continuous query.
 	ErrContinuousQueryNotFound = errors.New("continuous query not found")
-
-	// ErrShardNotLocal is thrown whan a server attempts to run a mapper against a shard it doesn't have a copy of.
-	ErrShardNotLocal = errors.New("shard not local")
 )
 
 func ErrDatabaseNotFound(name string) error { return Errorf("database not found: %s", name) }

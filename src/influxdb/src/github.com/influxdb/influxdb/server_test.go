@@ -991,6 +991,7 @@ func TestServer_WriteAllDataTypes(t *testing.T) {
 	s.MustWriteSeries("foo", "raw", []influxdb.Point{{Name: "series2", Timestamp: mustParseTime("2000-01-01T00:00:00Z"), Fields: map[string]interface{}{"value": int64(30)}}})
 	s.MustWriteSeries("foo", "raw", []influxdb.Point{{Name: "series3", Timestamp: mustParseTime("2000-01-01T00:00:00Z"), Fields: map[string]interface{}{"value": "baz"}}})
 	s.MustWriteSeries("foo", "raw", []influxdb.Point{{Name: "series4", Timestamp: mustParseTime("2000-01-01T00:00:00Z"), Fields: map[string]interface{}{"value": true}}})
+	time.Sleep(time.Millisecond * 100)
 
 	f := func(t *testing.T, database, query, expected string) {
 		results := s.executeQuery(MustParseQuery(query), database, nil)
@@ -1397,6 +1398,31 @@ func TestServer_DeleteShardGroup(t *testing.T) {
 		t.Fatal(err)
 	} else if len(g) != 0 {
 		t.Fatalf("expected 0 shard group but found %d", len(g))
+	}
+}
+
+// Ensure the server can stream shards to client
+func TestServer_CopyShard(t *testing.T) {
+	c := test.NewDefaultMessagingClient()
+	defer c.Close()
+	s := OpenServer(c)
+	defer s.Close()
+	s.CreateDatabase("foo")
+	s.CreateRetentionPolicy("foo", &influxdb.RetentionPolicy{Name: "raw", Duration: 1 * time.Hour})
+	s.SetDefaultRetentionPolicy("foo", "raw")
+
+	// Write series with one point to the database to ensure shard 1 is created.
+	s.MustWriteSeries("foo", "raw", []influxdb.Point{{Name: "series1", Fields: map[string]interface{}{"value": float64(20)}}})
+	time.Sleep(time.Millisecond * 100)
+
+	err := s.CopyShard(ioutil.Discard, 1234)
+	if err != influxdb.ErrShardNotFound {
+		t.Errorf("received unexpected result when requesting non-existing shard: %v", err)
+	}
+
+	err = s.CopyShard(ioutil.Discard, 1)
+	if err != nil {
+		t.Errorf("failed to copy shard 1: %s", err.Error())
 	}
 }
 

@@ -107,7 +107,8 @@ func TestBroker_Apply(t *testing.T) {
 	}
 }
 
-// Ensure the broker can apply topic high water mark messages.
+// Ensure the broker can apply topic high water mark messages, and provide correct URLs
+// for subsequent topic peer replication.
 func TestBroker_Apply_SetMaxTopicIndex(t *testing.T) {
 	b := OpenBroker()
 	defer b.Close()
@@ -133,8 +134,36 @@ func TestBroker_Apply_SetMaxTopicIndex(t *testing.T) {
 		t.Fatalf("apply error: %s", err)
 	}
 
-	if topic := b.Topic(20); topic.IndexForURL(*testDataURL) != 5 {
+	topic := b.Topic(20)
+	if topic.IndexForURL(*testDataURL) != 5 {
 		t.Fatalf("unexpected topic url index: %d", topic.IndexForURL(*testDataURL))
+	}
+
+	// Ensure the URLs that can serve the topic are correct.
+	var urls []url.URL
+	urls = topic.DataURLsForIndex(10)
+	if urls != nil {
+		t.Fatalf("URLs unexpectedly available for index 10")
+	}
+	urls = topic.DataURLsForIndex(5)
+	if urls == nil {
+		t.Fatalf("no URLs available for index 5")
+	}
+	if urls[0].String() != "http://localhost:1234/data" {
+		t.Fatalf("unexpectedURL for topic index 5: %s", urls[0].String())
+	}
+
+	// Ensure the Broker can provide URLs for topics at a given index.
+	urls = b.DataURLsForTopic(20, 6)
+	if urls != nil {
+		t.Fatalf("Broker unexpectedly provided URLs for topic index 6")
+	}
+	urls = b.DataURLsForTopic(20, 5)
+	if urls == nil {
+		t.Fatalf("Broker failed to provide URLs for topic index 5")
+	}
+	if urls[0].String() != "http://localhost:1234/data" {
+		t.Fatalf("unexpected broker-provided URL for topic index 5: %s", urls[0].String())
 	}
 }
 
@@ -415,6 +444,82 @@ func TestTopic_Recover_Checksum(t *testing.T) {
 	}
 }
 
+// Test that topics are correctly truncated.
+func TestTopic_Truncate(t *testing.T) {
+	topic := OpenTopic()
+	if topic.Truncated() {
+		t.Errorf("topic reports truncated which should not be the case")
+	}
+	topic.MaxSegmentSize = 10
+
+	// Force creation of 3 segments.
+	if err := topic.WriteMessage(&messaging.Message{Index: 7, Data: make([]byte, topic.MaxSegmentSize+1)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := topic.WriteMessage(&messaging.Message{Index: 10, Data: make([]byte, topic.MaxSegmentSize+1)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := topic.WriteMessage(&messaging.Message{Index: 15, Data: make([]byte, topic.MaxSegmentSize+1)}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Confirm segments.
+	segments := MustReadSegments(topic.Path())
+	if len(segments) != 3 {
+		t.Errorf("topic does not have correct number of segments, expected 3, got %d", len(segments))
+	}
+
+	// Test various truncation requests.
+
+	topic.Truncate(500) // no truncation required.
+	segments = MustReadSegments(topic.Path())
+	if len(MustReadSegments(topic.Path())) != 3 {
+		t.Errorf("topic does not have correct number of segments, expected 3, got %d", len(segments))
+	}
+	if topic.Truncated() {
+		t.Errorf("topic reports truncated which should not be the case")
+	}
+
+	topic.Truncate(5) // no replication has yet occurred.
+	segments = MustReadSegments(topic.Path())
+	if len(MustReadSegments(topic.Path())) != 3 {
+		t.Errorf("topic does not have correct number of segments, expected 3, got %d", len(segments))
+	}
+	if topic.Truncated() {
+		t.Errorf("topic reports truncated which should not be the case")
+	}
+
+	// Simulate replication of first segment.
+	topic.SetIndexForURL(11, *MustParseURL("http://127.0.0.1:8086"))
+	topic.Truncate(25) // 1 segment should now be dropped.
+	segments = MustReadSegments(topic.Path())
+	if len(MustReadSegments(topic.Path())) != 2 {
+		t.Errorf("topic does not have correct number of segments, expected 2, got %d", len(segments))
+	}
+	if segments[0].Index != 10 {
+		t.Errorf("wrong segment truncated, remaining segment has index %d", segments[0].Index)
+	}
+	if !topic.Truncated() {
+		t.Errorf("topic does not report as truncated")
+	}
+
+	topic.SetIndexForURL(100, *MustParseURL("http://127.0.0.1:8086"))
+	topic.Truncate(5) // always leave 2 segments around, regardless of truncation size and replication.
+	segments = MustReadSegments(topic.Path())
+	if len(MustReadSegments(topic.Path())) != 2 {
+		t.Fatalf("topic does not have correct number of segments, expected 2, got %d", len(segments))
+	}
+
+	// Test that adding a segment still works.
+	if err := topic.WriteMessage(&messaging.Message{Index: 200, Data: make([]byte, 20)}); err != nil {
+		t.Fatal(err)
+	}
+	segments = MustReadSegments(topic.Path())
+	if len(MustReadSegments(topic.Path())) != 3 {
+		t.Errorf("topic does not have correct number of segments, expected 2, got %d", len(segments))
+	}
+}
+
 // Topic is a wrapper for messaging.Topic that creates the topic in a temporary location.
 type Topic struct {
 	*messaging.Topic
@@ -692,6 +797,70 @@ func TestTopicReader_streaming(t *testing.T) {
 	r.Close()
 }
 
+// Ensure a topic reader correctly deals with truncated topics.
+func TestTopicReader_Truncated(t *testing.T) {
+	path, _ := ioutil.TempDir("", "")
+	defer os.RemoveAll(path)
+
+	// Generate segments in directory.
+	MustWriteFile(filepath.Join(path, "6"),
+		MustMarshalMessages([]*messaging.Message{
+			{Index: 6},
+			{Index: 7},
+			{Index: 10},
+		}),
+	)
+	MustWriteFile(filepath.Join(path, "12"),
+		MustMarshalMessages([]*messaging.Message{
+			{Index: 12},
+		}),
+	)
+
+	// Simulate a prior truncation.
+	MustWriteFile(filepath.Join(path, "tombstone"), []byte{})
+
+	// Execute table tests.
+	for i, tt := range []struct {
+		index   uint64   // starting index
+		results []uint64 // returned indices
+		err     error    // expected error. Ignored if not set.
+	}{
+		{index: 0, results: []uint64{}, err: messaging.ErrTopicTruncated},
+		{index: 6, results: []uint64{6, 7, 10, 12}},
+		{index: 7, results: []uint64{7, 10, 12}},
+		{index: 9, results: []uint64{10, 12}},
+		{index: 10, results: []uint64{10, 12}},
+		{index: 11, results: []uint64{12}},
+		{index: 12, results: []uint64{12}},
+		{index: 13, results: []uint64{}},
+	} {
+		// Start topic reader from an index.
+		r := messaging.NewTopicReader(path, tt.index, false)
+
+		// Slurp all message ids from the reader.
+		results := make([]uint64, 0)
+		dec := messaging.NewMessageDecoder(r)
+		for {
+			m := &messaging.Message{}
+			if err := dec.Decode(m); err == io.EOF {
+				break
+			} else if err != nil {
+				if tt.err != nil && tt.err == err {
+					break
+				}
+				t.Fatalf("%d. decode error: %s", i, err)
+			} else {
+				results = append(results, m.Index)
+			}
+		}
+
+		// Verify the retrieved indices match what's expected.
+		if !reflect.DeepEqual(results, tt.results) {
+			t.Fatalf("%d. %v: result mismatch:\n\nexp=%#v\n\ngot=%#v", i, tt.index, tt.results, results)
+		}
+	}
+}
+
 // Ensure multiple topic readers can read from the same topic directory.
 func BenchmarkTopicReaderStreaming(b *testing.B) {
 	path, _ := ioutil.TempDir("", "")
@@ -892,6 +1061,15 @@ func MustMarshalMessages(a []*messaging.Message) []byte {
 		}
 	}
 	return buf.Bytes()
+}
+
+// MustReadSegments returns the segments at the given path. Panic on error.
+func MustReadSegments(path string) messaging.Segments {
+	if segments, err := messaging.ReadSegments(path); err != nil {
+		panic(err.Error())
+	} else {
+		return segments
+	}
 }
 
 func warn(v ...interface{})              { fmt.Fprintln(os.Stderr, v...) }

@@ -74,12 +74,12 @@ func ListenAndServe(s *Server, iface string) error {
 	s.conn = conn
 
 	s.wg.Add(1)
-	go s.serve(s.done)
+	go s.serve()
 
 	return nil
 }
 
-func (s *Server) serve(done chan struct{}) {
+func (s *Server) serve() {
 	defer s.wg.Done()
 
 	// From https://collectd.org/wiki/index.php/Binary_protocol
@@ -171,7 +171,7 @@ func Unmarshal(data *gollectd.Packet) []influxdb.Point {
 		tags := make(map[string]string)
 		fields := make(map[string]interface{})
 
-		fields[name] = data.Values[i].Value
+		fields["value"] = data.Values[i].Value
 
 		if data.Hostname != "" {
 			tags["host"] = data.Hostname

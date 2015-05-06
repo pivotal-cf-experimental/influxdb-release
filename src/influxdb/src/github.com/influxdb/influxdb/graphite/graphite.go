@@ -39,6 +39,8 @@ type SeriesWriter interface {
 // Server defines the interface all Graphite servers support.
 type Server interface {
 	ListenAndServe(iface string) error
+	Host() string
+	Close() error
 }
 
 // NewServer return a Graphite server for the given protocol, using the given parser
@@ -81,7 +83,7 @@ func (p *Parser) Parse(line string) (influxdb.Point, error) {
 	// Parse value.
 	v, err := strconv.ParseFloat(fields[1], 64)
 	if err != nil {
-		return influxdb.Point{}, err
+		return influxdb.Point{}, fmt.Errorf("field \"%s\" value: %s", fields[0], err)
 	}
 
 	fieldValues := make(map[string]interface{})
@@ -90,7 +92,7 @@ func (p *Parser) Parse(line string) (influxdb.Point, error) {
 	// Parse timestamp.
 	unixTime, err := strconv.ParseFloat(fields[2], 64)
 	if err != nil {
-		return influxdb.Point{}, err
+		return influxdb.Point{}, fmt.Errorf("field \"%s\" timestamp: %s", fields[0], err)
 	}
 
 	// Check if we have fractional seconds

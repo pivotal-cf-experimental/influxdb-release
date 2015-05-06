@@ -210,22 +210,18 @@ func TestUnmarshal_Points(t *testing.T) {
 	}{
 		{
 			name: "single value",
-			points: []influxdb.Point{
-				{Name: "disk_read", Fields: map[string]interface{}{"disk_read": float64(1)}},
-			},
 			packet: gollectd.Packet{
 				Plugin: "disk",
 				Values: []gollectd.Value{
 					{Name: "read", Value: 1},
 				},
 			},
+			points: []influxdb.Point{
+				{Name: "disk_read", Fields: map[string]interface{}{"value": float64(1)}},
+			},
 		},
 		{
 			name: "multi value",
-			points: []influxdb.Point{
-				{Name: "disk_read", Fields: map[string]interface{}{"disk_read": float64(1)}},
-				{Name: "disk_write", Fields: map[string]interface{}{"disk_write": float64(5)}},
-			},
 			packet: gollectd.Packet{
 				Plugin: "disk",
 				Values: []gollectd.Value{
@@ -233,16 +229,13 @@ func TestUnmarshal_Points(t *testing.T) {
 					{Name: "write", Value: 5},
 				},
 			},
+			points: []influxdb.Point{
+				{Name: "disk_read", Fields: map[string]interface{}{"value": float64(1)}},
+				{Name: "disk_write", Fields: map[string]interface{}{"value": float64(5)}},
+			},
 		},
 		{
 			name: "tags",
-			points: []influxdb.Point{
-				{
-					Name:   "disk_read",
-					Tags:   map[string]string{"host": "server01", "instance": "sdk", "type": "disk_octets", "type_instance": "single"},
-					Fields: map[string]interface{}{"disk_read": float64(1)},
-				},
-			},
 			packet: gollectd.Packet{
 				Plugin:         "disk",
 				Hostname:       "server01",
@@ -251,6 +244,13 @@ func TestUnmarshal_Points(t *testing.T) {
 				TypeInstance:   "single",
 				Values: []gollectd.Value{
 					{Name: "read", Value: 1},
+				},
+			},
+			points: []influxdb.Point{
+				{
+					Name:   "disk_read",
+					Tags:   map[string]string{"host": "server01", "instance": "sdk", "type": "disk_octets", "type_instance": "single"},
+					Fields: map[string]interface{}{"value": float64(1)},
 				},
 			},
 		},
@@ -269,7 +269,7 @@ func TestUnmarshal_Points(t *testing.T) {
 				t.Errorf("point name mismatch. expected %q, got %q", name, m.Name)
 			}
 			// test value
-			mv := m.Fields[m.Name].(float64)
+			mv := m.Fields["value"].(float64)
 			pv := test.packet.Values[i].Value
 			if mv != pv {
 				t.Errorf("point value mismatch. expected %v, got %v", pv, mv)

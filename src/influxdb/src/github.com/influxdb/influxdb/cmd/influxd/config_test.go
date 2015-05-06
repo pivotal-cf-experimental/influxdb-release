@@ -103,7 +103,10 @@ enabled = false
 # Where the broker logs are stored. The user running InfluxDB will need read/write access.
 dir  = "/tmp/influxdb/development/broker"
 
-# election-timeout = "2s"
+# Raft distributed consensus
+[raft]
+apply-interval = "10ms"
+election-timeout = "1s"
 
 [data]
 dir = "/tmp/influxdb/development/db"
@@ -116,8 +119,7 @@ enabled = false
 disabled = true
 
 [snapshot]
-bind-address = "1.2.3.4"
-port = 9999
+enabled = true
 `
 
 // Ensure that megabyte sizes can be parsed.
@@ -237,8 +239,8 @@ func TestParseConfig(t *testing.T) {
 	switch {
 	case c.OpenTSDB.Enabled != true:
 		t.Errorf("opentsdb enabled mismatch: expected: %v, got %v", true, c.OpenTSDB.Enabled)
-	case c.OpenTSDB.ListenAddress(c.BindAddress) != "192.168.0.3:4242":
-		t.Errorf("opentsdb listen address mismatch: expected %v, got  %v", "192.168.0.3:4242", c.OpenTSDB.ListenAddress(c.BindAddress))
+	case c.OpenTSDB.ListenAddress() != "192.168.0.3:4242":
+		t.Errorf("opentsdb listen address mismatch: expected %v, got  %v", "192.168.0.3:4242", c.OpenTSDB.ListenAddress())
 	case c.OpenTSDB.DatabaseString() != "opentsdb_database":
 		t.Errorf("opentsdb database mismatch: expected %v, got %v", "opentsdb_database", c.OpenTSDB.DatabaseString())
 	case c.OpenTSDB.RetentionPolicy != "raw":
@@ -251,6 +253,10 @@ func TestParseConfig(t *testing.T) {
 
 	if c.Broker.Enabled != false {
 		t.Fatalf("broker disabled mismatch: %v, got: %v", false, c.Broker.Enabled)
+	}
+
+	if c.Raft.ApplyInterval != main.Duration(10*time.Millisecond) {
+		t.Fatalf("Raft apply interval mismatch: %v, got %v", 10*time.Millisecond, c.Raft.ApplyInterval)
 	}
 
 	if c.Data.Dir != "/tmp/influxdb/development/db" {
@@ -271,13 +277,10 @@ func TestParseConfig(t *testing.T) {
 		t.Fatalf("Monitoring.WriteInterval mismatch: %v", c.Monitoring.WriteInterval)
 	}
 
-	if exp := "1.2.3.4"; c.Snapshot.BindAddress != exp {
-		t.Fatalf("snapshot bind-address mismatch: %v, got %v", exp, c.Snapshot.BindAddress)
+	if !c.Snapshot.Enabled {
+		t.Fatalf("snapshot enabled mismatch: %v, got %v", true, c.Snapshot.Enabled)
 	}
 
-	if exp := 9999; c.Snapshot.Port != exp {
-		t.Fatalf("snapshot port mismatch: %v, got %v", exp, c.Snapshot.Port)
-	}
 	// TODO: UDP Servers testing.
 	/*
 		c.Assert(config.UdpServers, HasLen, 1)

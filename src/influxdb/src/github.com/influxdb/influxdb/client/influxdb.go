@@ -45,7 +45,7 @@ func NewClient(c Config) (*Client, error) {
 		url:        c.URL,
 		username:   c.Username,
 		password:   c.Password,
-		httpClient: &http.Client{},
+		httpClient: http.DefaultClient,
 		userAgent:  c.UserAgent,
 	}
 	if client.userAgent == "" {
@@ -54,14 +54,17 @@ func NewClient(c Config) (*Client, error) {
 	return &client, nil
 }
 
+// SetAuth will update the username and passwords
+func (c *Client) SetAuth(u, p string) {
+	c.username = u
+	c.password = p
+}
+
 // Query sends a command to the server and returns the Response
 func (c *Client) Query(q Query) (*Response, error) {
 	u := c.url
 
 	u.Path = "query"
-	if c.username != "" {
-		u.User = url.UserPassword(c.username, c.password)
-	}
 	values := u.Query()
 	values.Set("q", q.Command)
 	values.Set("db", q.Database)
@@ -72,6 +75,10 @@ func (c *Client) Query(q Query) (*Response, error) {
 		return nil, err
 	}
 	req.Header.Set("User-Agent", c.userAgent)
+	if c.username != "" {
+		req.SetBasicAuth(c.username, c.password)
+	}
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -81,9 +88,19 @@ func (c *Client) Query(q Query) (*Response, error) {
 	var response Response
 	dec := json.NewDecoder(resp.Body)
 	dec.UseNumber()
-	err = dec.Decode(&response)
-	if err != nil {
-		return nil, err
+	decErr := dec.Decode(&response)
+
+	// ignore this error if we got an invalid status code
+	if decErr != nil && decErr.Error() == "EOF" && resp.StatusCode != http.StatusOK {
+		decErr = nil
+	}
+	// If we got a valid decode error, send that back
+	if decErr != nil {
+		return nil, decErr
+	}
+	// If we don't have an error in our json response, and didn't get  statusOK, then send back an error
+	if resp.StatusCode != http.StatusOK && response.Error() == nil {
+		return &response, fmt.Errorf("received status code %d from server", resp.StatusCode)
 	}
 	return &response, nil
 }
@@ -105,6 +122,10 @@ func (c *Client) Write(bp BatchPoints) (*Response, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", c.userAgent)
+	if c.username != "" {
+		req.SetBasicAuth(c.username, c.password)
+	}
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -138,6 +159,10 @@ func (c *Client) Ping() (time.Duration, string, error) {
 		return 0, "", err
 	}
 	req.Header.Set("User-Agent", c.userAgent)
+	if c.username != "" {
+		req.SetBasicAuth(c.username, c.password)
+	}
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return 0, "", err
@@ -153,8 +178,6 @@ func (c *Client) Dump(db string) (io.ReadCloser, error) {
 	u.Path = "dump"
 	values := u.Query()
 	values.Set("db", db)
-	values.Set("user", c.username)
-	values.Set("password", c.password)
 	u.RawQuery = values.Encode()
 
 	req, err := http.NewRequest("GET", u.String(), nil)
@@ -162,6 +185,10 @@ func (c *Client) Dump(db string) (io.ReadCloser, error) {
 		return nil, err
 	}
 	req.Header.Set("User-Agent", c.userAgent)
+	if c.username != "" {
+		req.SetBasicAuth(c.username, c.password)
+	}
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, err

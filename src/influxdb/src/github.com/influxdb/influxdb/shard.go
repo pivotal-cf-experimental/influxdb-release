@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -20,39 +21,90 @@ type ShardGroup struct {
 }
 
 // newShardGroup returns a new initialized ShardGroup instance.
-func newShardGroup() *ShardGroup { return &ShardGroup{} }
+func newShardGroup(t time.Time, d time.Duration) *ShardGroup {
+	sg := ShardGroup{}
+	sg.StartTime = t.Truncate(d).UTC()
+	sg.EndTime = sg.StartTime.Add(d).UTC()
 
-// close closes all shards.
-func (g *ShardGroup) close() {
-	for _, sh := range g.Shards {
-		_ = sh.close()
+	return &sg
+}
+
+func (sg *ShardGroup) initialize(index uint64, shardN, replicaN int, db *database, rp *RetentionPolicy, nodes []*DataNode, meta *metastore) error {
+	sg.Shards = make([]*Shard, shardN)
+
+	// Persist to metastore if a shard was created.
+	return meta.mustUpdate(index, func(tx *metatx) error {
+		// Generate an ID for the group.
+		sg.ID = tx.nextShardGroupID()
+
+		// Generate an ID for each shard.
+		for i := range sg.Shards {
+			sg.Shards[i] = newShard(tx.nextShardID())
+		}
+
+		// Assign data nodes to shards via round robin.
+		// Start from a repeatably "random" place in the node list.
+		nodeIndex := int(index % uint64(len(nodes)))
+		for _, sh := range sg.Shards {
+			for i := 0; i < replicaN; i++ {
+				node := nodes[nodeIndex%len(nodes)]
+				sh.DataNodeIDs = append(sh.DataNodeIDs, node.ID)
+				nodeIndex++
+			}
+		}
+
+		// Retention policy has a new shard group, so update the policy.
+		rp.shardGroups = append(rp.shardGroups, sg)
+
+		return tx.saveDatabase(db)
+	})
+}
+
+func (sg *ShardGroup) close(id uint64) error {
+	for _, shard := range sg.Shards {
+		// Ignore shards not on this server.
+		if !shard.HasDataNodeID(id) {
+			continue
+		}
+
+		path := shard.store.Path()
+		shard.close()
+		if err := os.Remove(path); err != nil {
+			return fmt.Errorf("shard id %d, path %s : %s", shard.ID, path, err)
+		}
 	}
+	return nil
 }
 
 // ShardBySeriesID returns the shard that a series is assigned to in the group.
-func (g *ShardGroup) ShardBySeriesID(seriesID uint64) *Shard {
-	return g.Shards[int(seriesID)%len(g.Shards)]
+func (sg *ShardGroup) ShardBySeriesID(seriesID uint64) *Shard {
+	return sg.Shards[int(seriesID)%len(sg.Shards)]
 }
 
 // Duration returns the duration between the shard group's start and end time.
-func (g *ShardGroup) Duration() time.Duration { return g.EndTime.Sub(g.StartTime) }
+func (sg *ShardGroup) Duration() time.Duration { return sg.EndTime.Sub(sg.StartTime) }
 
 // Contains return whether the shard group contains data for the time between min and max
-func (g *ShardGroup) Contains(min, max time.Time) bool {
-	return timeBetweenInclusive(g.StartTime, min, max) ||
-		timeBetweenInclusive(g.EndTime, min, max) ||
-		(g.StartTime.Before(min) && g.EndTime.After(max))
+func (sg *ShardGroup) Contains(min, max time.Time) bool {
+	return timeBetweenInclusive(sg.StartTime, min, max) ||
+		timeBetweenInclusive(sg.EndTime, min, max) ||
+		(sg.StartTime.Before(min) && sg.EndTime.After(max))
 }
 
 // dropSeries will delete all data with the seriesID
-func (g *ShardGroup) dropSeries(seriesIDs ...uint64) error {
-	for _, s := range g.Shards {
+func (sg *ShardGroup) dropSeries(seriesIDs ...uint64) error {
+	for _, s := range sg.Shards {
 		err := s.dropSeries(seriesIDs...)
 		if err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// shardtx represents a shard transaction.
+type shardtx struct {
+	*bolt.Tx
 }
 
 // Shard represents the logical storage for a given time range.
@@ -74,25 +126,35 @@ type Shard struct {
 }
 
 // newShard returns a new initialized Shard instance.
-func newShard() *Shard { return &Shard{} }
+func newShard(id uint64) *Shard {
+	s := &Shard{}
+	s.ID = id
+	s.stats = NewStats(fmt.Sprintf("shard %d", id))
+	s.stats.Inc("initialize")
+
+	return s
+}
 
 // open initializes and opens the shard's store.
 func (s *Shard) open(path string, conn MessagingConn) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.stats == nil {
+		s.stats = NewStats(fmt.Sprintf("shard %d", s.ID))
+	}
+	s.stats.Inc("open")
+
 	// Return an error if the shard is already open.
 	if s.store != nil {
+		s.stats.Inc("errAlreadyOpen")
 		return errors.New("shard already open")
-	}
-
-	if s.stats == nil {
-		s.stats = NewStats("shard")
 	}
 
 	// Open store on shard.
 	store, err := bolt.Open(path, 0666, &bolt.Options{Timeout: 1 * time.Second})
 	if err != nil {
+		s.stats.Inc("errBoltOpenFailure")
 		return err
 	}
 	s.store = store
@@ -112,6 +174,7 @@ func (s *Shard) open(path string, conn MessagingConn) error {
 
 		return nil
 	}); err != nil {
+		s.stats.Inc("errBoltStoreUpdateFailure")
 		_ = s.close()
 		return fmt.Errorf("init: %s", err)
 	}
@@ -133,6 +196,31 @@ func shardMetaIndex(tx *bolt.Tx) uint64 {
 	return index
 }
 
+// view executes a function in the context of a read-only transaction.
+func (s *Shard) view(fn func(*shardtx) error) error {
+	return s.store.View(func(tx *bolt.Tx) error { return fn(&shardtx{tx}) })
+}
+
+// mustView executes a function in the context of a read-only transaction.
+// Panics if system error occurs. Return error from the fn for validation errors.
+func (s *Shard) mustView(fn func(*shardtx) error) (err error) {
+	if e := s.view(func(tx *shardtx) error {
+		err = fn(tx)
+		return nil
+	}); e != nil {
+		panic("shard view: " + e.Error())
+	}
+	return
+}
+
+// Index returns the highest Raft index processed by this shard. Shard RLock
+// held during execution.
+func (s *Shard) Index() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.index
+}
+
 // close shuts down the shard's store.
 func (s *Shard) close() error {
 	// Wait for goroutines to stop.
@@ -145,6 +233,9 @@ func (s *Shard) close() error {
 
 	if s.store != nil {
 		_ = s.store.Close()
+	}
+	if s.stats != nil {
+		s.stats.Inc("close")
 	}
 	return nil
 }

@@ -7,6 +7,7 @@ import (
 	"net/textproto"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/influxdb/influxdb"
@@ -35,6 +36,10 @@ type Server struct {
 	retentionpolicy string
 
 	listener *net.TCPListener
+	wg       sync.WaitGroup
+
+	addr net.Addr
+	mu   sync.Mutex
 }
 
 func NewServer(w SeriesWriter, retpol string, db string) *Server {
@@ -45,6 +50,12 @@ func NewServer(w SeriesWriter, retpol string, db string) *Server {
 	s.database = db
 
 	return s
+}
+
+func (s *Server) Addr() net.Addr {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.addr
 }
 
 func (s *Server) ListenAndServe(listenAddress string) {
@@ -62,20 +73,37 @@ func (s *Server) ListenAndServe(listenAddress string) {
 		return
 	}
 
-	defer s.listener.Close()
-	s.HandleListener(s.listener)
+	s.mu.Lock()
+	s.addr = s.listener.Addr()
+	s.mu.Unlock()
+
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		for {
+			conn, err := s.listener.Accept()
+			if opErr, ok := err.(*net.OpError); ok && !opErr.Temporary() {
+				log.Println("openTSDB TCP listener closed")
+				return
+			}
+			if err != nil {
+				log.Println("error accepting openTSDB: ", err.Error())
+				continue
+			}
+			s.wg.Add(1)
+			go s.HandleConnection(conn)
+		}
+	}()
 }
 
-func (s *Server) HandleListener(socket *net.TCPListener) {
-	for {
-		// Listen for an incoming connection.
-		conn, err := socket.Accept()
-		if err != nil {
-			log.Println("Error accepting: ", err.Error())
-		}
-		// Handle connections in a new goroutine.
-		go s.HandleConnection(conn)
+func (s *Server) Close() error {
+	var err error
+	if s.listener != nil {
+		err = (*s.listener).Close()
 	}
+	s.wg.Wait()
+	s.listener = nil
+	return err
 }
 
 func (s *Server) HandleConnection(conn net.Conn) {
@@ -83,10 +111,12 @@ func (s *Server) HandleConnection(conn net.Conn) {
 	tp := textproto.NewReader(reader)
 
 	defer conn.Close()
+	defer s.wg.Done()
 
 	for {
 		line, err := tp.ReadLine()
 		if err != nil {
+			log.Println("error reading from openTSDB connection", err.Error())
 			return
 		}
 
@@ -138,7 +168,7 @@ func (s *Server) HandleConnection(conn net.Conn) {
 		}
 
 		fields := make(map[string]interface{})
-		fields[name], err = strconv.ParseFloat(valueStr, 64)
+		fields["value"], err = strconv.ParseFloat(valueStr, 64)
 		if err != nil {
 			log.Println("TSDBServer: could not parse value as float: ", valueStr)
 			continue

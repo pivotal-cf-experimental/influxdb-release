@@ -23,6 +23,7 @@ type Handler struct {
 			io.ReadCloser
 			io.Seeker
 		}
+		DataURLsForTopic(id, index uint64) []url.URL
 		Publish(m *Message) (uint64, error)
 		SetTopicMaxIndex(topicID, index uint64, u url.URL) error
 	}
@@ -100,7 +101,22 @@ func (h *Handler) getMessages(w http.ResponseWriter, req *http.Request) {
 
 	// Write out all data from the topic reader.
 	// Automatically flush as reads come in.
-	if _, err := CopyFlush(w, r); err != nil {
+	if _, err := CopyFlush(w, r); err == ErrTopicTruncated {
+		// Broker unable to provide data for the requested index, provide another URL.
+		urls := h.Broker.DataURLsForTopic(topicID, index)
+		if urls == nil {
+			h.error(w, ErrTopicNodesNotFound, http.StatusInternalServerError)
+			return
+		}
+
+		// Send back a list of URLs where the topic data can be fetched.
+		var redirects []string
+		for _, u := range urls {
+			redirects = append(redirects, u.String())
+		}
+		w.Header().Set("X-Broker-DataURLs", strings.Join(redirects, ","))
+		http.Redirect(w, req, urls[0].String(), http.StatusTemporaryRedirect)
+	} else if err != nil {
 		log.Printf("message stream error: %s", err)
 	}
 }
@@ -231,7 +247,9 @@ func CopyFlush(dst io.Writer, src io.Reader) (written int64, err error) {
 			}
 
 			// Flush after write.
-			if dst, ok := dst.(http.Flusher); ok {
+			if dst, ok := dst.(interface {
+				Flush()
+			}); ok {
 				dst.Flush()
 			}
 

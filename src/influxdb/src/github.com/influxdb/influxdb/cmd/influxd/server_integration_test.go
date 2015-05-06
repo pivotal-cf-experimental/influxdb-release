@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -21,10 +23,17 @@ import (
 	main "github.com/influxdb/influxdb/cmd/influxd"
 )
 
+func init() {
+	fmt.Printf("System Info: CPU=%d GOMAXPROCS=%d\n", runtime.NumCPU(), runtime.GOMAXPROCS(0))
+}
+
 const (
 	// Use a prime batch size, so that internal batching code, which most likely
 	// uses nice round batches, has to deal with leftover.
 	batchSize = 4217
+
+	openTSDBTestTimeout = 5 * time.Second
+	graphiteTestTimeout = 5 * time.Second
 )
 
 type writeFn func(t *testing.T, node *TestNode, database, retention string)
@@ -76,7 +85,6 @@ func (c *Cluster) Close() {
 //
 // This function returns a slice of nodes, the first of which will be the leader.
 func createCombinedNodeCluster(t *testing.T, testName, tmpDir string, nNodes int, baseConfig *main.Config) Cluster {
-	basePort := 8086
 	t.Logf("Creating cluster of %d nodes for test %s", nNodes, testName)
 	if nNodes < 1 {
 		t.Fatalf("Test %s: asked to create nonsense cluster", testName)
@@ -99,17 +107,20 @@ func createCombinedNodeCluster(t *testing.T, testName, tmpDir string, nNodes int
 	if c == nil {
 		c, _ = main.NewTestConfig()
 	}
+	basePort := 0
 	c.Broker.Dir = filepath.Join(tmpBrokerDir, strconv.Itoa(basePort))
 	c.Data.Dir = filepath.Join(tmpDataDir, strconv.Itoa(basePort))
 	c.Port = basePort
+	c.Admin.Port = 0
 	c.Admin.Enabled = false
 	c.ReportingDisabled = true
 	c.Snapshot.Enabled = false
+	c.Logging.HTTPAccess = false
 
 	cmd := main.NewRunCommand()
-	node := cmd.Open(c, "")
-	b := node.Broker
-	s := node.DataNode
+	baseNode := cmd.Open(c, "")
+	b := baseNode.Broker
+	s := baseNode.DataNode
 
 	if b == nil {
 		t.Fatalf("Test %s: failed to create broker on port %d", testName, basePort)
@@ -118,31 +129,42 @@ func createCombinedNodeCluster(t *testing.T, testName, tmpDir string, nNodes int
 		t.Fatalf("Test %s: failed to create leader data node on port %d", testName, basePort)
 	}
 	nodes = append(nodes, &TestNode{
-		node:   node,
-		url:    &url.URL{Scheme: "http", Host: "localhost:" + strconv.Itoa(basePort)},
+		node:   baseNode,
+		url:    baseNode.ClusterURL(),
 		leader: true,
 	})
+	t.Log(baseNode.ClusterURL())
 
 	// Create subsequent nodes, which join to first node.
 	for i := 1; i < nNodes; i++ {
-		nextPort := basePort + i
-		c.Broker.Dir = filepath.Join(tmpBrokerDir, strconv.Itoa(nextPort))
-		c.Data.Dir = filepath.Join(tmpDataDir, strconv.Itoa(nextPort))
-		c.Port = nextPort
+		c.Broker.Dir = filepath.Join(tmpBrokerDir, strconv.Itoa(i))
+		c.Data.Dir = filepath.Join(tmpDataDir, strconv.Itoa(i))
+		c.Port = 0
 
 		cmd := main.NewRunCommand()
-		node := cmd.Open(c, "http://localhost:"+strconv.Itoa(basePort))
+		node := cmd.Open(c, baseNode.ClusterURL().String())
 		if node.Broker == nil {
-			t.Fatalf("Test %s: failed to create following broker on port %d", testName, nextPort)
+			t.Fatalf("Test %s: failed to create following broker on addr %s", testName, node.ClusterURL().String())
 		}
 		if node.DataNode == nil {
-			t.Fatalf("Test %s: failed to create following data node on port %d", testName, nextPort)
+			t.Fatalf("Test %s: failed to create following data node on addr %s", testName, node.ClusterURL().String())
 		}
 
 		nodes = append(nodes, &TestNode{
 			node: node,
-			url:  &url.URL{Scheme: "http", Host: "localhost:" + strconv.Itoa(nextPort)},
+			url:  node.ClusterURL(),
 		})
+		t.Log(node.ClusterURL())
+
+	}
+
+	// Sanity check that we created a cluster and data nodes have unique ids
+	ids := make(map[int]bool)
+	for _, n := range nodes {
+		ids[int(n.node.DataNode.ID())] = true
+	}
+	if len(ids) != len(nodes) {
+		t.Fatalf("failed to create valid cluster. some data nodes have the same id: %v", ids)
 	}
 
 	return nodes
@@ -168,6 +190,24 @@ func deleteDatabase(t *testing.T, testName string, nodes Cluster, database strin
 	query(t, nodes[:1], "", "DROP DATABASE "+database, `{"results":[{}]}`, "")
 }
 
+// dumpClusterDiags dumps the diagnostics of each node.
+func dumpClusterDiags(t *testing.T, testName string, nodes Cluster) {
+	t.Logf("Test: %s: dumping node diagnostics", testName)
+	for _, n := range nodes {
+		r, _, _ := query(t, Cluster{n}, "", "SHOW DIAGNOSTICS", "", "")
+		t.Log(r)
+	}
+}
+
+// dumpClusterStats dumps the statistics of each node.
+func dumpClusterStats(t *testing.T, testName string, nodes Cluster) {
+	t.Logf("Test: %s: dumping node stats", testName)
+	for _, n := range nodes {
+		r, _, _ := query(t, Cluster{n}, "", "SHOW STATS", "", "")
+		t.Log(r)
+	}
+}
+
 // writes writes the provided data to the cluster. It verfies that a 200 OK is returned by the server.
 func write(t *testing.T, node *TestNode, data string) {
 	u := urlFor(node.url, "write", url.Values{})
@@ -176,8 +216,11 @@ func write(t *testing.T, node *TestNode, data string) {
 	if err != nil {
 		t.Fatalf("Couldn't write data: %s", err)
 	}
+	defer resp.Body.Close()
 	body, _ := ioutil.ReadAll(resp.Body)
-	fmt.Println("BODY: ", string(body))
+	if string(body) != "" {
+		t.Log("BODY: ", string(body))
+	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := ioutil.ReadAll(resp.Body)
 		t.Fatalf("Write to database failed.  Unexpected status code.  expected: %d, actual %d, %s", http.StatusOK, resp.StatusCode, string(body))
@@ -186,7 +229,7 @@ func write(t *testing.T, node *TestNode, data string) {
 
 // query executes the given query against all nodes in the cluster, and verifies no errors occured, and
 // ensures the returned data is as expected
-func query(t *testing.T, nodes Cluster, urlDb, query, expected, expectPattern string) (string, bool) {
+func query(t *testing.T, nodes Cluster, urlDb, query, expected, expectPattern string) (string, bool, int) {
 	v := url.Values{"q": []string{query}}
 	if urlDb != "" {
 		v.Set("db", urlDb)
@@ -194,7 +237,7 @@ func query(t *testing.T, nodes Cluster, urlDb, query, expected, expectPattern st
 
 	var actual string
 	// Query the data exists
-	for _, n := range nodes {
+	for i, n := range nodes {
 		u := urlFor(n.url, "query", v)
 		resp, err := http.Get(u.String())
 		if err != nil {
@@ -209,27 +252,27 @@ func query(t *testing.T, nodes Cluster, urlDb, query, expected, expectPattern st
 		actual = string(body)
 
 		if expected != "" && expected != actual {
-			return actual, false
+			return actual, false, i
 		} else if expectPattern != "" {
 			re := regexp.MustCompile(expectPattern)
 			if !re.MatchString(actual) {
-				return actual, false
+				return actual, false, i
 			}
 		}
 	}
 
-	return actual, true
+	return actual, true, len(nodes)
 }
 
 // queryAndWait executes the given query against all nodes in the cluster, and verifies no errors occured, and
 // ensures the returned data is as expected until the timeout occurs
-func queryAndWait(t *testing.T, nodes Cluster, urlDb, q, expected, expectPattern string, timeout time.Duration) (string, bool) {
+func queryAndWait(t *testing.T, nodes Cluster, urlDb, q, expected, expectPattern string, timeout time.Duration) (string, bool, int) {
 	v := url.Values{"q": []string{q}}
 	if urlDb != "" {
 		v.Set("db", urlDb)
 	}
 
-	sleep := 10 * time.Millisecond
+	sleep := 100 * time.Millisecond
 	// Check to see if they set the env for duration sleep
 	if sleepRaw := os.Getenv("TEST_SLEEP"); sleepRaw != "" {
 		d, err := time.ParseDuration(sleepRaw)
@@ -248,14 +291,18 @@ func queryAndWait(t *testing.T, nodes Cluster, urlDb, q, expected, expectPattern
 		defer timer.Stop()
 	}
 
+	nQueriedOK := 0
 	for {
-		got, ok := query(t, nodes, urlDb, q, expected, expectPattern)
+		got, ok, n := query(t, nodes, urlDb, q, expected, expectPattern)
+		if n > nQueriedOK {
+			nQueriedOK = n
+		}
 		if ok {
-			return got, ok
+			return got, ok, nQueriedOK
 		}
 		select {
 		case <-done:
-			return got, false
+			return got, false, nQueriedOK
 		case <-time.After(sleep):
 		}
 	}
@@ -301,9 +348,11 @@ func runTest_rawDataReturnsInOrder(t *testing.T, testName string, nodes Cluster,
 	}
 
 	expected = fmt.Sprintf(`{"results":[{"series":[{"name":"cpu","columns":["time","count"],"values":[["1970-01-01T00:00:00Z",%d]]}]}]}`, numPoints-1)
-	got, ok := queryAndWait(t, nodes, database, `SELECT count(value) FROM cpu`, expected, "", 120*time.Second)
+	got, ok, nOK := queryAndWait(t, nodes, database, `SELECT count(value) FROM cpu`, expected, "", 120*time.Second)
 	if !ok {
-		t.Errorf("test %s:rawDataReturnsInOrder failed, SELECT count() query returned unexpected data\nexp: %s\n, got: %s", testName, expected, got)
+		t.Errorf("test %s:rawDataReturnsInOrder failed, SELECT count() query returned unexpected data\nexp: %s\ngot: %s\n%d nodes responded correctly", testName, expected, got, nOK)
+		dumpClusterDiags(t, testName, nodes)
+		dumpClusterStats(t, testName, nodes)
 	}
 
 	// Create expected JSON string dynamically.
@@ -312,9 +361,11 @@ func runTest_rawDataReturnsInOrder(t *testing.T, testName string, nodes Cluster,
 		expectedValues = append(expectedValues, fmt.Sprintf(`["%s",%d]`, time.Unix(int64(i), int64(0)).UTC().Format(time.RFC3339), i))
 	}
 	expected = fmt.Sprintf(`{"results":[{"series":[{"name":"cpu","columns":["time","value"],"values":[%s]}]}]}`, strings.Join(expectedValues, ","))
-	got, ok = query(t, nodes, database, `SELECT value FROM cpu`, expected, "")
+	got, ok, nOK = query(t, nodes, database, `SELECT value FROM cpu`, expected, "")
 	if !ok {
-		t.Errorf("test %s failed, SELECT query returned unexpected data\nexp: %s\ngot: %s", testName, expected, got)
+		t.Errorf("test %s failed, SELECT query returned unexpected data\nexp: %s\ngot: %s\n%d nodes responded correctly", testName, expected, got, nOK)
+		dumpClusterDiags(t, testName, nodes)
+		dumpClusterStats(t, testName, nodes)
 	}
 }
 
@@ -342,9 +393,9 @@ func runTests_Errors(t *testing.T, nodes Cluster) {
 		}
 
 		if tt.query != "" {
-			got, ok := query(t, nodes, "", tt.query, tt.expected, "")
+			got, ok, nOK := query(t, nodes, "", tt.query, tt.expected, "")
 			if !ok {
-				t.Errorf("Test '%s' failed, expected: %s, got: %s", tt.name, tt.expected, got)
+				t.Errorf("Test '%s' failed, expected: %s, got: %s, %d nodes responded correctly", tt.name, tt.expected, got, nOK)
 			}
 		}
 	}
@@ -356,6 +407,7 @@ func runTestsData(t *testing.T, testName string, nodes Cluster, database, retent
 
 	yesterday := time.Now().Add(-1 * time.Hour * 24).UTC()
 	now := time.Now().UTC()
+	maxFloat64, _ := json.Marshal(math.MaxFloat64)
 
 	// Start by ensuring database and retention policy exist.
 	createDatabase(t, testName, nodes, database)
@@ -402,7 +454,7 @@ func runTestsData(t *testing.T, testName string, nodes Cluster, database, retent
 		},
 		{
 			name:     "single point, select with now()",
-			query:    `SELECT * FROM "%DB%"."%RP%".cpu WHERE time < now()`,
+			query:    `SELECT * FROM "%DB%"."%RP%".cpu WHERE time < NOW()`,
 			expected: `{"results":[{"series":[{"name":"cpu","columns":["time","value"],"values":[["2015-02-28T01:03:36.703820946Z",100]]}]}]}`,
 		},
 		{
@@ -436,6 +488,16 @@ func runTestsData(t *testing.T, testName string, nodes Cluster, database, retent
 		                                                                        ]}`,
 			query:    `SELECT * FROM "%DB%"."%RP%".cpu`,
 			expected: `{"results":[{"series":[{"name":"cpu","columns":["time","value"],"values":[["2015-02-28T01:03:36.703820946Z",100],["2015-02-28T01:04:36.703820946Z",100]]}]}]}`,
+		},
+
+		{
+			reset: true,
+			name:  "two points with negative values",
+			write: `{"database" : "%DB%", "retentionPolicy" : "%RP%", "points": [{"name": "cpu", "timestamp": "2015-02-28T01:04:36.703820946Z", "fields": {"value": -200}},
+                                                                                 {"name": "cpu", "timestamp": "2015-02-28T01:03:36.703820946Z", "fields": {"value": -100}}
+                                                                                ]}`,
+			query:    `SELECT * FROM "%DB%"."%RP%".cpu`,
+			expected: `{"results":[{"series":[{"name":"cpu","columns":["time","value"],"values":[["2015-02-28T01:03:36.703820946Z",-100],["2015-02-28T01:04:36.703820946Z",-200]]}]}]}`,
 		},
 
 		// Data read and write tests using relative time
@@ -519,6 +581,67 @@ func runTestsData(t *testing.T, testName string, nodes Cluster, database, retent
 		// Aggregations
 		{
 			reset: true,
+			name:  "stddev with just one point",
+			write: `{"database" : "%DB%", "retentionPolicy" : "%RP%", "points": [
+				{"name": "cpu", "timestamp": "2015-04-20T14:27:41Z", "fields": {"value": 45}}
+			]}`,
+			query:    `SELECT STDDEV(value) FROM cpu`,
+			queryDb:  "%DB%",
+			expected: `{"results":[{"series":[{"name":"cpu","columns":["time","stddev"],"values":[["1970-01-01T00:00:00Z",null]]}]}]}`,
+		},
+		{
+			reset: true,
+			name:  "large mean and stddev",
+			write: `{"database" : "%DB%", "retentionPolicy" : "%RP%", "points": [
+				{"name": "cpu", "timestamp": "2015-04-20T14:27:40Z", "fields": {"value": ` + string(maxFloat64) + `}},
+				{"name": "cpu", "timestamp": "2015-04-20T14:27:41Z", "fields": {"value": ` + string(maxFloat64) + `}}
+			]}`,
+			query:    `SELECT MEAN(value), STDDEV(value) FROM cpu`,
+			queryDb:  "%DB%",
+			expected: `{"results":[{"series":[{"name":"cpu","columns":["time","mean","stddev"],"values":[["1970-01-01T00:00:00Z",` + string(maxFloat64) + `,0]]}]}]}`,
+		},
+		{
+			reset: true,
+			name:  "mean and stddev",
+			write: `{"database" : "%DB%", "retentionPolicy" : "%RP%", "points": [
+				{"name": "cpu", "timestamp": "2000-01-01T00:00:00Z", "fields": {"value": 2}},
+				{"name": "cpu", "timestamp": "2000-01-01T00:00:10Z", "fields": {"value": 4}},
+				{"name": "cpu", "timestamp": "2000-01-01T00:00:20Z", "fields": {"value": 4}},
+				{"name": "cpu", "timestamp": "2000-01-01T00:00:30Z", "fields": {"value": 4}},
+				{"name": "cpu", "timestamp": "2000-01-01T00:00:40Z", "fields": {"value": 5}},
+				{"name": "cpu", "timestamp": "2000-01-01T00:00:50Z", "fields": {"value": 5}},
+				{"name": "cpu", "timestamp": "2000-01-01T00:01:00Z", "fields": {"value": 7}},
+				{"name": "cpu", "timestamp": "2000-01-01T00:01:10Z", "fields": {"value": 9}}
+			]}`,
+			query:    `SELECT MEAN(value), STDDEV(value) FROM cpu WHERE time >= '2000-01-01' AND time < '2000-01-01T00:02:00Z' GROUP BY time(10m)`,
+			queryDb:  "%DB%",
+			expected: `{"results":[{"series":[{"name":"cpu","columns":["time","mean","stddev"],"values":[["2000-01-01T00:00:00Z",5,2.138089935299395]]}]}]}`,
+		},
+		{
+			name: "median - even sample size",
+			write: `{"database" : "%DB%", "retentionPolicy" : "%RP%", "points": [
+				{"name": "cpu-even", "timestamp": "2000-01-01T00:00:00Z", "tags": {"region": "us-east"}, "fields": {"value": 200}},
+				{"name": "cpu-even", "timestamp": "2000-01-01T00:00:10Z", "tags": {"region": "us-east"}, "fields": {"value": 30}},
+				{"name": "cpu-even", "timestamp": "2000-01-01T00:00:20Z", "tags": {"region": "us-east"}, "fields": {"value": 40}},
+				{"name": "cpu-even", "timestamp": "2000-01-01T00:00:30Z", "tags": {"region": "us-west"}, "fields": {"value": 100}}
+			]}`,
+			query:    `SELECT median(value) FROM "cpu-even"`,
+			queryDb:  "%DB%",
+			expected: `{"results":[{"series":[{"name":"cpu-even","columns":["time","median"],"values":[["1970-01-01T00:00:00Z",70]]}]}]}`,
+		},
+		{
+			name: "median - odd sample size",
+			write: `{"database" : "%DB%", "retentionPolicy" : "%RP%", "points": [
+				{"name": "cpu-odd", "timestamp": "2000-01-01T00:00:00Z", "tags": {"region": "us-east"}, "fields": {"value": 200}},
+				{"name": "cpu-odd", "timestamp": "2000-01-01T00:00:10Z", "tags": {"region": "us-east"}, "fields": {"value": 30}},
+				{"name": "cpu-odd", "timestamp": "2000-01-01T00:00:20Z", "tags": {"region": "us-west"}, "fields": {"value": 100}}
+			]}`,
+			query:    `SELECT median(value) FROM "cpu-odd"`,
+			queryDb:  "%DB%",
+			expected: `{"results":[{"series":[{"name":"cpu-odd","columns":["time","median"],"values":[["1970-01-01T00:00:00Z",100]]}]}]}`,
+		},
+		{
+			reset: true,
 			name:  "aggregations",
 			write: `{"database" : "%DB%", "retentionPolicy" : "%RP%", "points": [
 				{"name": "cpu", "timestamp": "2000-01-01T00:00:00Z", "tags": {"region": "us-east"}, "fields": {"value": 20}},
@@ -531,7 +654,7 @@ func runTestsData(t *testing.T, testName string, nodes Cluster, database, retent
 		},
 		{
 			name:     "sum aggregation",
-			query:    `SELECT sum(value) FROM cpu WHERE time >= '2000-01-01 00:00:05' AND time <= '2000-01-01T00:00:10Z' GROUP BY time(10s), region`,
+			query:    `SELECT SUM(value) FROM cpu WHERE time >= '2000-01-01 00:00:05' AND time <= '2000-01-01T00:00:10Z' GROUP BY time(10s), region`,
 			queryDb:  "%DB%",
 			expected: `{"results":[{"series":[{"name":"cpu","tags":{"region":"us-east"},"columns":["time","sum"],"values":[["2000-01-01T00:00:00Z",null],["2000-01-01T00:00:10Z",30]]}]}]}`,
 		},
@@ -540,13 +663,13 @@ func runTestsData(t *testing.T, testName string, nodes Cluster, database, retent
 				{"name": "cpu", "timestamp": "2000-01-01T00:00:03Z", "tags": {"region": "us-east"}, "fields": {"otherVal": 20}}
 			]}`,
 			name:     "aggregation with a null field value",
-			query:    `SELECT sum(value) FROM cpu GROUP BY region`,
+			query:    `SELECT SUM(value) FROM cpu GROUP BY region`,
 			queryDb:  "%DB%",
 			expected: `{"results":[{"series":[{"name":"cpu","tags":{"region":"us-east"},"columns":["time","sum"],"values":[["1970-01-01T00:00:00Z",50]]},{"name":"cpu","tags":{"region":"us-west"},"columns":["time","sum"],"values":[["1970-01-01T00:00:00Z",100]]}]}]}`,
 		},
 		{
 			name:     "multiple aggregations",
-			query:    `SELECT sum(value), mean(value) FROM cpu GROUP BY region`,
+			query:    `SELECT SUM(value), MEAN(value) FROM cpu GROUP BY region`,
 			queryDb:  "%DB%",
 			expected: `{"results":[{"series":[{"name":"cpu","tags":{"region":"us-east"},"columns":["time","sum","mean"],"values":[["1970-01-01T00:00:00Z",50,25]]},{"name":"cpu","tags":{"region":"us-west"},"columns":["time","sum","mean"],"values":[["1970-01-01T00:00:00Z",100,100]]}]}]}`,
 		},
@@ -629,7 +752,7 @@ func runTestsData(t *testing.T, testName string, nodes Cluster, database, retent
 		},
 		{
 			name:     "wildcard GROUP BY queries with time",
-			query:    `SELECT mean(value) FROM cpu WHERE time >= '2000-01-01T00:00:00Z' AND time < '2000-01-01T00:01:00Z' GROUP BY *,time(1m)`,
+			query:    `SELECT mean(value) FROM cpu WHERE time >= '2000-01-01T00:00:00Z' AND time < '2000-01-01T00:01:00Z' GROUP BY *,TIME(1m)`,
 			queryDb:  "%DB%",
 			expected: `{"results":[{"series":[{"name":"cpu","tags":{"region":"us-east"},"columns":["time","mean"],"values":[["2000-01-01T00:00:00Z",15]]},{"name":"cpu","tags":{"region":"us-west"},"columns":["time","mean"],"values":[["2000-01-01T00:00:00Z",30]]}]}]}`,
 		},
@@ -815,6 +938,12 @@ func runTestsData(t *testing.T, testName string, nodes Cluster, database, retent
 			query:    `select foo from "%DB%"."%RP%".where_events where tennant = 'paul' AND time > 1s AND (foo = 'bar' OR foo = 'baz')`,
 			expected: `{"results":[{"series":[{"name":"where_events","columns":["time","foo"],"values":[["2009-11-10T23:00:02Z","bar"],["2009-11-10T23:00:03Z","baz"]]}]}]}`,
 		},
+		{
+			name:          "where on tag that should be double quoted but isn't",
+			queryDb:       "%DB%",
+			query:         `show series where data-center = 'foo'`,
+			expectPattern: `invalid expression: .*`,
+		},
 
 		// LIMIT and OFFSET tests
 
@@ -851,27 +980,27 @@ func runTestsData(t *testing.T, testName string, nodes Cluster, database, retent
 		},
 		{
 			name:     "limit on points with group by time",
-			query:    `select mean(foo) from "%DB%"."%RP%"."limit" WHERE time >= '2009-11-10T23:00:02Z' AND time < '2009-11-10T23:00:06Z' GROUP BY time(1s) LIMIT 2`,
+			query:    `select mean(foo) from "%DB%"."%RP%"."limit" WHERE time >= '2009-11-10T23:00:02Z' AND time < '2009-11-10T23:00:06Z' GROUP BY TIME(1s) LIMIT 2`,
 			expected: `{"results":[{"series":[{"name":"limit","columns":["time","mean"],"values":[["2009-11-10T23:00:02Z",2],["2009-11-10T23:00:03Z",3]]}]}]}`,
 		},
 		{
 			name:     "limit higher than the number of data points with group by time",
-			query:    `select mean(foo) from "%DB%"."%RP%"."limit" WHERE time >= '2009-11-10T23:00:02Z' AND time < '2009-11-10T23:00:06Z' GROUP BY time(1s) LIMIT 20`,
+			query:    `select mean(foo) from "%DB%"."%RP%"."limit" WHERE time >= '2009-11-10T23:00:02Z' AND time < '2009-11-10T23:00:06Z' GROUP BY TIME(1s) LIMIT 20`,
 			expected: `{"results":[{"series":[{"name":"limit","columns":["time","mean"],"values":[["2009-11-10T23:00:02Z",2],["2009-11-10T23:00:03Z",3],["2009-11-10T23:00:04Z",4],["2009-11-10T23:00:05Z",5]]}]}]}`,
 		},
 		{
 			name:     "limit and offset with group by time",
-			query:    `select mean(foo) from "%DB%"."%RP%"."limit" WHERE time >= '2009-11-10T23:00:02Z' AND time < '2009-11-10T23:00:06Z' GROUP BY time(1s) LIMIT 2 OFFSET 1`,
+			query:    `select mean(foo) from "%DB%"."%RP%"."limit" WHERE time >= '2009-11-10T23:00:02Z' AND time < '2009-11-10T23:00:06Z' GROUP BY TIME(1s) LIMIT 2 OFFSET 1`,
 			expected: `{"results":[{"series":[{"name":"limit","columns":["time","mean"],"values":[["2009-11-10T23:00:03Z",3],["2009-11-10T23:00:04Z",4]]}]}]}`,
 		},
 		{
 			name:     "limit + offset equal to the  number of points with group by time",
-			query:    `select mean(foo) from "%DB%"."%RP%"."limit" WHERE time >= '2009-11-10T23:00:02Z' AND time < '2009-11-10T23:00:06Z' GROUP BY time(1s) LIMIT 3 OFFSET 3`,
+			query:    `select mean(foo) from "%DB%"."%RP%"."limit" WHERE time >= '2009-11-10T23:00:02Z' AND time < '2009-11-10T23:00:06Z' GROUP BY TIME(1s) LIMIT 3 OFFSET 3`,
 			expected: `{"results":[{"series":[{"name":"limit","columns":["time","mean"],"values":[["2009-11-10T23:00:05Z",5]]}]}]}`,
 		},
 		{
 			name:     "limit - offset higher than number of points with group by time",
-			query:    `select mean(foo) from "%DB%"."%RP%"."limit" WHERE time >= '2009-11-10T23:00:02Z' AND time < '2009-11-10T23:00:06Z' GROUP BY time(1s) LIMIT 2 OFFSET 20`,
+			query:    `select mean(foo) from "%DB%"."%RP%"."limit" WHERE time >= '2009-11-10T23:00:02Z' AND time < '2009-11-10T23:00:06Z' GROUP BY TIME(1s) LIMIT 2 OFFSET 20`,
 			expected: `{"results":[{}]}`,
 		},
 		{
@@ -894,23 +1023,33 @@ func runTestsData(t *testing.T, testName string, nodes Cluster, database, retent
 				{"name": "fills", "timestamp": "2009-11-10T23:00:06Z","fields": {"val": 4}},
 				{"name": "fills", "timestamp": "2009-11-10T23:00:16Z","fields": {"val": 10}}
 			]}`,
-			query:    `select mean(val) from "%DB%"."%RP%".fills where time >= '2009-11-10T23:00:00Z' and time < '2009-11-10T23:00:20Z' group by time(5s) fill(1)`,
+			query:    `select mean(val) from "%DB%"."%RP%".fills where time >= '2009-11-10T23:00:00Z' and time < '2009-11-10T23:00:20Z' group by time(5s) FILL(1)`,
 			expected: `{"results":[{"series":[{"name":"fills","columns":["time","mean"],"values":[["2009-11-10T23:00:00Z",4],["2009-11-10T23:00:05Z",4],["2009-11-10T23:00:10Z",1],["2009-11-10T23:00:15Z",10]]}]}]}`,
 		},
 		{
 			name:     "fill with previous",
-			query:    `select mean(val) from "%DB%"."%RP%".fills where time >= '2009-11-10T23:00:00Z' and time < '2009-11-10T23:00:20Z' group by time(5s) fill(previous)`,
+			query:    `select mean(val) from "%DB%"."%RP%".fills where time >= '2009-11-10T23:00:00Z' and time < '2009-11-10T23:00:20Z' group by time(5s) FILL(previous)`,
 			expected: `{"results":[{"series":[{"name":"fills","columns":["time","mean"],"values":[["2009-11-10T23:00:00Z",4],["2009-11-10T23:00:05Z",4],["2009-11-10T23:00:10Z",4],["2009-11-10T23:00:15Z",10]]}]}]}`,
 		},
 		{
 			name:     "fill with none, i.e. clear out nulls",
-			query:    `select mean(val) from "%DB%"."%RP%".fills where time >= '2009-11-10T23:00:00Z' and time < '2009-11-10T23:00:20Z' group by time(5s) fill(none)`,
+			query:    `select mean(val) from "%DB%"."%RP%".fills where time >= '2009-11-10T23:00:00Z' and time < '2009-11-10T23:00:20Z' group by time(5s) FILL(none)`,
 			expected: `{"results":[{"series":[{"name":"fills","columns":["time","mean"],"values":[["2009-11-10T23:00:00Z",4],["2009-11-10T23:00:05Z",4],["2009-11-10T23:00:15Z",10]]}]}]}`,
 		},
 		{
 			name:     "fill defaults to null",
 			query:    `select mean(val) from "%DB%"."%RP%".fills where time >= '2009-11-10T23:00:00Z' and time < '2009-11-10T23:00:20Z' group by time(5s)`,
 			expected: `{"results":[{"series":[{"name":"fills","columns":["time","mean"],"values":[["2009-11-10T23:00:00Z",4],["2009-11-10T23:00:05Z",4],["2009-11-10T23:00:10Z",null],["2009-11-10T23:00:15Z",10]]}]}]}`,
+		},
+		{
+			name:     "fill with count aggregate defaults to null",
+			query:    `select count(val) from "%DB%"."%RP%".fills where time >= '2009-11-10T23:00:00Z' and time < '2009-11-10T23:00:20Z' group by time(5s)`,
+			expected: `{"results":[{"series":[{"name":"fills","columns":["time","count"],"values":[["2009-11-10T23:00:00Z",2],["2009-11-10T23:00:05Z",1],["2009-11-10T23:00:10Z",null],["2009-11-10T23:00:15Z",1]]}]}]}`,
+		},
+		{
+			name:     "fill with count aggregate specific value",
+			query:    `select count(val) from "%DB%"."%RP%".fills where time >= '2009-11-10T23:00:00Z' and time < '2009-11-10T23:00:20Z' group by time(5s) fill(1234)`,
+			expected: `{"results":[{"series":[{"name":"fills","columns":["time","count"],"values":[["2009-11-10T23:00:00Z",2],["2009-11-10T23:00:05Z",1],["2009-11-10T23:00:10Z",1234],["2009-11-10T23:00:15Z",1]]}]}]}`,
 		},
 
 		// Drop Measurement, series tags preserved tests
@@ -1271,13 +1410,14 @@ func runTestsData(t *testing.T, testName string, nodes Cluster, database, retent
 		// Continuous query control.
 		{
 			name:     "create continuous query",
-			query:    `CREATE CONTINUOUS QUERY myquery ON %DB% BEGIN SELECT count(value) INTO measure1 FROM myseries GROUP BY time(10m) END`,
+			query:    `CREATE CONTINUOUS QUERY "my.query" ON %DB% BEGIN SELECT count(value) INTO measure1 FROM myseries GROUP BY time(10m) END`,
 			queryOne: true,
 			expected: `{"results":[{}]}`,
 		},
 		{
+			name:     `show continuous queries`,
 			query:    `SHOW CONTINUOUS QUERIES`,
-			expected: `{"results":[{"series":[{"name":"%DB%","columns":["name","query"],"values":[["myquery","CREATE CONTINUOUS QUERY myquery ON %DB% BEGIN SELECT count(value) INTO \"%DB%\".\"%RP%\".measure1 FROM \"%DB%\".\"%RP%\".myseries GROUP BY time(10m) END"]]}]}]}`,
+			expected: `{"results":[{"series":[{"name":"%DB%","columns":["name","query"],"values":[["my.query","CREATE CONTINUOUS QUERY \"my.query\" ON %DB% BEGIN SELECT count(value) INTO \"%DB%\".\"%RP%\".measure1 FROM \"%DB%\".\"%RP%\".myseries GROUP BY time(10m) END"]]}]}]}`,
 		},
 	}
 
@@ -1315,8 +1455,8 @@ func runTestsData(t *testing.T, testName string, nodes Cluster, database, retent
 			continue
 		}
 
-		fmt.Printf("TEST: %d: %s\n", i, name)
-		t.Logf("Running test %d: %s", i, name)
+		fmt.Printf("TEST %d '%s:%s'\n", i, testName, name)
+		t.Logf("Running test %d '%s:%s'", i, testName, name)
 
 		if tt.reset {
 			t.Logf(`reseting for test "%s"`, name)
@@ -1344,27 +1484,52 @@ func runTestsData(t *testing.T, testName string, nodes Cluster, database, retent
 				urlDb = tt.queryDb
 			}
 			qry := rewriteDbRp(tt.query, database, retention)
-			got, ok := queryAndWait(t, qNodes, rewriteDbRp(urlDb, database, retention), qry, rewriteDbRp(tt.expected, database, retention), rewriteDbRp(tt.expectPattern, database, retention), 60*time.Second)
+			got, ok, nOK := queryAndWait(t, qNodes, rewriteDbRp(urlDb, database, retention), qry, rewriteDbRp(tt.expected, database, retention), rewriteDbRp(tt.expectPattern, database, retention), 30*time.Second)
 			if !ok {
 				if tt.expected != "" {
-					t.Errorf("Test #%d: \"%s\" failed\n  query: %s\n  exp: %s\n  got: %s\n", i, name, qry, rewriteDbRp(tt.expected, database, retention), got)
+					t.Errorf("Test #%d: \"%s:%s\" failed\n  query: %s\n  exp: %s\n  got: %s\n%d nodes responded correctly", i, testName, name, qry, rewriteDbRp(tt.expected, database, retention), got, nOK)
 				} else {
-					t.Errorf("Test #%d: \"%s\" failed\n  query: %s\n  exp: %s\n  got: %s\n", i, name, qry, rewriteDbRp(tt.expectPattern, database, retention), got)
+					t.Errorf("Test #%d: \"%s:%s\" failed\n  query: %s\n  exp: %s\n  got: %s\n%d nodes responded correctly", i, testName, name, qry, rewriteDbRp(tt.expectPattern, database, retention), got, nOK)
 				}
+				dumpClusterDiags(t, name, nodes)
+				dumpClusterStats(t, name, nodes)
 			}
 		}
 	}
 }
 
+// Ensures that diagnostics can be written to the internal database.
+func TestServerDiags(t *testing.T) {
+	t.Parallel()
+	testName := "single server integration diagnostics"
+	if testing.Short() {
+		t.Skip(fmt.Sprintf("skipping '%s'", testName))
+	}
+	dir := tempfile()
+	defer os.RemoveAll(dir)
+
+	config := main.NewConfig()
+	config.Monitoring.Enabled = true
+	config.Monitoring.WriteInterval = main.Duration(100 * time.Millisecond)
+	nodes := createCombinedNodeCluster(t, testName, dir, 3, config)
+	defer nodes.Close()
+
+	// Ensure some data shards also exist.
+	createDatabase(t, testName, nodes, "mydb")
+	createRetentionPolicy(t, testName, nodes, "mydb", "myrp", len(nodes))
+	write(t, nodes[0], `{"database" : "mydb", "retentionPolicy" : "myrp", "points": [{"name": "cpu", "fields": {"value": 100}}]}`)
+
+	time.Sleep(1 * time.Second)
+}
+
 func TestSingleServer(t *testing.T) {
+	t.Parallel()
 	testName := "single server integration"
 	if testing.Short() {
 		t.Skip(fmt.Sprintf("skipping '%s'", testName))
 	}
 	dir := tempfile()
-	defer func() {
-		os.RemoveAll(dir)
-	}()
+	defer os.RemoveAll(dir)
 
 	nodes := createCombinedNodeCluster(t, testName, dir, 1, nil)
 	defer nodes.Close()
@@ -1374,52 +1539,69 @@ func TestSingleServer(t *testing.T) {
 }
 
 func Test3NodeServer(t *testing.T) {
+	t.Parallel()
 	testName := "3-node server integration"
 
 	if testing.Short() {
 		t.Skip(fmt.Sprintf("skipping '%s'", testName))
 	}
 	dir := tempfile()
-	defer func() {
-		os.RemoveAll(dir)
-	}()
+	defer os.RemoveAll(dir)
 
 	nodes := createCombinedNodeCluster(t, testName, dir, 3, nil)
 	defer nodes.Close()
 
 	runTestsData(t, testName, nodes, "mydb", "myrp", len(nodes))
 	runTest_rawDataReturnsInOrder(t, testName, nodes, "mydb", "myrp", len(nodes))
-
 }
 
-// ensure that all queries work if there are more nodes in a cluster than the replication factor
-func Test3NodeClusterPartiallyReplicated(t *testing.T) {
-	t.Skip("Skipping due to instability")
-	testName := "3-node server integration partial replication"
+func Test3NodeServerFailover(t *testing.T) {
+	t.Parallel()
+	testName := "3-node server failover integration"
+
 	if testing.Short() {
 		t.Skip(fmt.Sprintf("skipping '%s'", testName))
 	}
 	dir := tempfile()
-	defer func() {
-		os.RemoveAll(dir)
-	}()
+	defer os.RemoveAll(dir)
 
 	nodes := createCombinedNodeCluster(t, testName, dir, 3, nil)
+
+	// kill the last node, cluster should expect it to be there
+	nodes[2].node.Close()
+	nodes = nodes[:len(nodes)-1]
+
+	runTestsData(t, testName, nodes, "mydb", "myrp", len(nodes))
+	runTest_rawDataReturnsInOrder(t, testName, nodes, "mydb", "myrp", len(nodes))
+	nodes.Close()
+}
+
+// ensure that all queries work if there are more nodes in a cluster than the replication factor
+// and there is more than 1 shards
+func Test5NodeClusterPartiallyReplicated(t *testing.T) {
+	t.Parallel()
+	testName := "5-node server integration partial replication"
+	if testing.Short() {
+		t.Skip(fmt.Sprintf("skipping '%s'", testName))
+	}
+	dir := tempfile()
+	defer os.RemoveAll(dir)
+
+	nodes := createCombinedNodeCluster(t, testName, dir, 5, nil)
 	defer nodes.Close()
 
-	runTestsData(t, testName, nodes, "mydb", "myrp", len(nodes)-1)
-	runTest_rawDataReturnsInOrder(t, testName, nodes, "mydb", "myrp", len(nodes)-1)
+	runTestsData(t, testName, nodes, "mydb", "myrp", 2)
+	runTest_rawDataReturnsInOrder(t, testName, nodes, "mydb", "myrp", 2)
 }
 
 func TestClientLibrary(t *testing.T) {
+	t.Parallel()
 	testName := "single server integration via client library"
 	if testing.Short() {
 		t.Skip(fmt.Sprintf("skipping '%s'", testName))
 	}
 	dir := tempfile()
-	defer func() {
-		os.RemoveAll(dir)
-	}()
+	defer os.RemoveAll(dir)
 
 	now := time.Now().UTC()
 
@@ -1546,7 +1728,8 @@ func TestClientLibrary(t *testing.T) {
 	}
 }
 
-func Test_ServerSingleGraphiteIntegration(t *testing.T) {
+func Test_ServerSingleGraphiteIntegration_Default(t *testing.T) {
+	t.Parallel()
 	if testing.Short() {
 		t.Skip()
 	}
@@ -1555,22 +1738,28 @@ func Test_ServerSingleGraphiteIntegration(t *testing.T) {
 	dir := tempfile()
 	now := time.Now().UTC().Round(time.Second)
 	c, _ := main.NewTestConfig()
+	c.Port = 0
+	c.Admin.Enabled = false
 	g := main.Graphite{
-		Enabled:  true,
-		Database: "graphite",
-		Protocol: "TCP",
+		Enabled:     true,
+		Database:    "graphite",
+		Protocol:    "TCP",
+		BindAddress: "127.0.0.1",
+		Port:        0,
 	}
 	c.Graphites = append(c.Graphites, g)
 
-	t.Logf("Graphite Connection String: %s\n", g.ConnectionString(c.BindAddress))
+	t.Logf("Graphite Connection String: %s\n", g.ConnectionString())
 	nodes := createCombinedNodeCluster(t, testName, dir, nNodes, c)
 	defer nodes.Close()
 
 	createDatabase(t, testName, nodes, "graphite")
 	createRetentionPolicy(t, testName, nodes, "graphite", "raw", len(nodes))
 
+	// Get the address for the graphite endpoint that we just spun up
+	host := nodes[0].node.GraphiteServers[0].Host()
 	// Connect to the graphite endpoint we just spun up
-	conn, err := net.Dial("tcp", g.ConnectionString(c.BindAddress))
+	conn, err := net.Dial("tcp", host)
 	if err != nil {
 		t.Fatal(err)
 		return
@@ -1590,13 +1779,14 @@ func Test_ServerSingleGraphiteIntegration(t *testing.T) {
 	expected := fmt.Sprintf(`{"results":[{"series":[{"name":"cpu","columns":["time","cpu"],"values":[["%s",23.456]]}]}]}`, now.Format(time.RFC3339Nano))
 
 	// query and wait for results
-	got, ok := queryAndWait(t, nodes, "graphite", `select * from "graphite"."raw".cpu`, expected, "", 2*time.Second)
+	got, ok, _ := queryAndWait(t, nodes, "graphite", `select * from "graphite"."raw".cpu`, expected, "", graphiteTestTimeout)
 	if !ok {
 		t.Errorf(`Test "%s" failed, expected: %s, got: %s`, testName, expected, got)
 	}
 }
 
 func Test_ServerSingleGraphiteIntegration_FractionalTime(t *testing.T) {
+	t.Parallel()
 	if testing.Short() {
 		t.Skip()
 	}
@@ -1605,23 +1795,28 @@ func Test_ServerSingleGraphiteIntegration_FractionalTime(t *testing.T) {
 	dir := tempfile()
 	now := time.Now().UTC().Round(time.Second).Add(500 * time.Millisecond)
 	c, _ := main.NewTestConfig()
+	c.Port = 0
+	c.Admin.Enabled = false
 	g := main.Graphite{
-		Enabled:  true,
-		Database: "graphite",
-		Protocol: "TCP",
-		Port:     2103,
+		Enabled:     true,
+		Database:    "graphite",
+		Protocol:    "TCP",
+		BindAddress: "127.0.0.1",
+		Port:        0,
 	}
 	c.Graphites = append(c.Graphites, g)
 
-	t.Logf("Graphite Connection String: %s\n", g.ConnectionString(c.BindAddress))
+	t.Logf("Graphite Connection String: %s\n", g.ConnectionString())
 	nodes := createCombinedNodeCluster(t, testName, dir, nNodes, c)
 	defer nodes.Close()
 
 	createDatabase(t, testName, nodes, "graphite")
 	createRetentionPolicy(t, testName, nodes, "graphite", "raw", len(nodes))
 
+	// Get the address for the graphite endpoint that we just spun up
+	host := nodes[0].node.GraphiteServers[0].Host()
 	// Connect to the graphite endpoint we just spun up
-	conn, err := net.Dial("tcp", g.ConnectionString(c.BindAddress))
+	conn, err := net.Dial("tcp", host)
 	if err != nil {
 		t.Fatal(err)
 		return
@@ -1642,13 +1837,14 @@ func Test_ServerSingleGraphiteIntegration_FractionalTime(t *testing.T) {
 	expected := fmt.Sprintf(`{"results":[{"series":[{"name":"cpu","columns":["time","cpu"],"values":[["%s",23.456]]}]}]}`, now.Format(time.RFC3339Nano))
 
 	// query and wait for results
-	got, ok := queryAndWait(t, nodes, "graphite", `select * from "graphite"."raw".cpu`, expected, "", 2*time.Second)
+	got, ok, _ := queryAndWait(t, nodes, "graphite", `select * from "graphite"."raw".cpu`, expected, "", graphiteTestTimeout)
 	if !ok {
 		t.Errorf(`Test "%s" failed, expected: %s, got: %s`, testName, expected, got)
 	}
 }
 
 func Test_ServerSingleGraphiteIntegration_ZeroDataPoint(t *testing.T) {
+	t.Parallel()
 	if testing.Short() {
 		t.Skip()
 	}
@@ -1657,23 +1853,28 @@ func Test_ServerSingleGraphiteIntegration_ZeroDataPoint(t *testing.T) {
 	dir := tempfile()
 	now := time.Now().UTC().Round(time.Second)
 	c, _ := main.NewTestConfig()
+	c.Port = 0
+	c.Admin.Enabled = false
 	g := main.Graphite{
-		Enabled:  true,
-		Database: "graphite",
-		Protocol: "TCP",
-		Port:     2203,
+		Enabled:     true,
+		Database:    "graphite",
+		Protocol:    "TCP",
+		BindAddress: "127.0.0.1",
+		Port:        0,
 	}
 	c.Graphites = append(c.Graphites, g)
 
-	t.Logf("Graphite Connection String: %s\n", g.ConnectionString(c.BindAddress))
+	t.Logf("Graphite Connection String: %s\n", g.ConnectionString())
 	nodes := createCombinedNodeCluster(t, testName, dir, nNodes, c)
 	defer nodes.Close()
 
 	createDatabase(t, testName, nodes, "graphite")
 	createRetentionPolicy(t, testName, nodes, "graphite", "raw", len(nodes))
 
+	// Get the address for the graphite endpoint that we just spun up
+	host := nodes[0].node.GraphiteServers[0].Host()
 	// Connect to the graphite endpoint we just spun up
-	conn, err := net.Dial("tcp", g.ConnectionString(c.BindAddress))
+	conn, err := net.Dial("tcp", host)
 	if err != nil {
 		t.Fatal(err)
 		return
@@ -1693,13 +1894,14 @@ func Test_ServerSingleGraphiteIntegration_ZeroDataPoint(t *testing.T) {
 	expected := fmt.Sprintf(`{"results":[{"series":[{"name":"cpu","columns":["time","cpu"],"values":[["%s",0]]}]}]}`, now.Format(time.RFC3339Nano))
 
 	// query and wait for results
-	got, ok := queryAndWait(t, nodes, "graphite", `select * from "graphite"."raw".cpu`, expected, "", 2*time.Second)
+	got, ok, _ := queryAndWait(t, nodes, "graphite", `select * from "graphite"."raw".cpu`, expected, "", graphiteTestTimeout)
 	if !ok {
 		t.Errorf(`Test "%s" failed, expected: %s, got: %s`, testName, expected, got)
 	}
 }
 
 func Test_ServerSingleGraphiteIntegration_NoDatabase(t *testing.T) {
+	t.Parallel()
 	if testing.Short() {
 		t.Skip()
 	}
@@ -1708,19 +1910,24 @@ func Test_ServerSingleGraphiteIntegration_NoDatabase(t *testing.T) {
 	dir := tempfile()
 	now := time.Now().UTC().Round(time.Second)
 	c, _ := main.NewTestConfig()
+	c.Port = 0
+	c.Admin.Enabled = false
 	g := main.Graphite{
-		Enabled:  true,
-		Port:     2303,
-		Protocol: "TCP",
+		Enabled:     true,
+		Protocol:    "TCP",
+		BindAddress: "127.0.0.1",
+		Port:        0,
 	}
 	c.Graphites = append(c.Graphites, g)
 	c.Logging.WriteTracing = true
-	t.Logf("Graphite Connection String: %s\n", g.ConnectionString(c.BindAddress))
+	t.Logf("Graphite Connection String: %s\n", g.ConnectionString())
 	nodes := createCombinedNodeCluster(t, testName, dir, nNodes, c)
 	defer nodes.Close()
 
+	// Get the address for the graphite endpoint that we just spun up
+	host := nodes[0].node.GraphiteServers[0].Host()
 	// Connect to the graphite endpoint we just spun up
-	conn, err := net.Dial("tcp", g.ConnectionString(c.BindAddress))
+	conn, err := net.Dial("tcp", host)
 	if err != nil {
 		t.Fatal(err)
 		return
@@ -1728,14 +1935,14 @@ func Test_ServerSingleGraphiteIntegration_NoDatabase(t *testing.T) {
 
 	// Need to wait for the database to be created
 	expected := `{"results":[{"series":[{"name":"databases","columns":["name"],"values":[["graphite"]]}]}]}`
-	got, ok := queryAndWait(t, nodes, "graphite", `show databases`, expected, "", 2*time.Second)
+	got, ok, _ := queryAndWait(t, nodes, "graphite", `show databases`, expected, "", 2*time.Second)
 	if !ok {
 		t.Errorf(`Test "%s" failed, expected: %s, got: %s`, testName, expected, got)
 	}
 
 	// Need to wait for the database to get a default retention policy
 	expected = `{"results":[{"series":[{"columns":["name","duration","replicaN","default"],"values":[["default","0",1,true]]}]}]}`
-	got, ok = queryAndWait(t, nodes, "graphite", `show retention policies graphite`, expected, "", 2*time.Second)
+	got, ok, _ = queryAndWait(t, nodes, "graphite", `show retention policies graphite`, expected, "", graphiteTestTimeout)
 	if !ok {
 		t.Errorf(`Test "%s" failed, expected: %s, got: %s`, testName, expected, got)
 	}
@@ -1753,13 +1960,14 @@ func Test_ServerSingleGraphiteIntegration_NoDatabase(t *testing.T) {
 
 	// Wait for data to show up
 	expected = fmt.Sprintf(`{"results":[{"series":[{"name":"cpu","columns":["time","cpu"],"values":[["%s",23.456]]}]}]}`, now.Format(time.RFC3339Nano))
-	got, ok = queryAndWait(t, nodes, "graphite", `select * from "graphite"."default".cpu`, expected, "", 2*time.Second)
+	got, ok, _ = queryAndWait(t, nodes, "graphite", `select * from "graphite"."default".cpu`, expected, "", 2*time.Second)
 	if !ok {
 		t.Errorf(`Test "%s" failed, expected: %s, got: %s`, testName, expected, got)
 	}
 }
 
 func Test_ServerOpenTSDBIntegration(t *testing.T) {
+	t.Parallel()
 	if testing.Short() {
 		t.Skip()
 	}
@@ -1769,22 +1977,24 @@ func Test_ServerOpenTSDBIntegration(t *testing.T) {
 	now := time.Now().UTC().Round(time.Second)
 	c, _ := main.NewTestConfig()
 	o := main.OpenTSDB{
-		Port:            4242,
+		Addr:            "127.0.0.1",
+		Port:            0,
 		Enabled:         true,
 		Database:        "opentsdb",
 		RetentionPolicy: "raw",
 	}
 	c.OpenTSDB = o
 
-	t.Logf("OpenTSDB Connection String: %s\n", o.ListenAddress(c.BindAddress))
+	t.Logf("OpenTSDB Connection String: %s\n", o.ListenAddress())
 	nodes := createCombinedNodeCluster(t, testName, dir, nNodes, c)
 	defer nodes.Close()
 
 	createDatabase(t, testName, nodes, "opentsdb")
 	createRetentionPolicy(t, testName, nodes, "opentsdb", "raw", len(nodes))
 
-	// Connect to the graphite endpoint we just spun up
-	conn, err := net.Dial("tcp", o.ListenAddress(c.BindAddress))
+	// Connect to the openTSDB endpoint we just spun up
+	host := nodes[0].node.OpenTSDBServer.Addr().String()
+	conn, err := net.Dial("tcp", host)
 	if err != nil {
 		t.Fatal(err)
 		return
@@ -1801,16 +2011,17 @@ func Test_ServerOpenTSDBIntegration(t *testing.T) {
 		return
 	}
 
-	expected := fmt.Sprintf(`{"results":[{"series":[{"name":"cpu","columns":["time","cpu"],"values":[["%s",10]]}]}]}`, now.Format(time.RFC3339Nano))
+	expected := fmt.Sprintf(`{"results":[{"series":[{"name":"cpu","columns":["time","value"],"values":[["%s",10]]}]}]}`, now.Format(time.RFC3339Nano))
 
 	// query and wait for results
-	got, ok := queryAndWait(t, nodes, "opentsdb", `select * from "opentsdb"."raw".cpu`, expected, "", 2*time.Second)
+	got, ok, _ := queryAndWait(t, nodes, "opentsdb", `select * from "opentsdb"."raw".cpu`, expected, "", openTSDBTestTimeout)
 	if !ok {
 		t.Errorf(`Test "%s" failed, expected: %s, got: %s`, testName, expected, got)
 	}
 }
 
 func Test_ServerOpenTSDBIntegration_WithTags(t *testing.T) {
+	t.Parallel()
 	if testing.Short() {
 		t.Skip()
 	}
@@ -1819,23 +2030,27 @@ func Test_ServerOpenTSDBIntegration_WithTags(t *testing.T) {
 	dir := tempfile()
 	now := time.Now().UTC().Round(time.Second)
 	c, _ := main.NewTestConfig()
+	c.Port = 0
+	c.Admin.Enabled = false
 	o := main.OpenTSDB{
-		Port:            4243,
+		Addr:            "127.0.0.1",
+		Port:            0,
 		Enabled:         true,
 		Database:        "opentsdb",
 		RetentionPolicy: "raw",
 	}
 	c.OpenTSDB = o
 
-	t.Logf("OpenTSDB Connection String: %s\n", o.ListenAddress(c.BindAddress))
+	t.Logf("OpenTSDB Connection String: %s\n", o.ListenAddress())
 	nodes := createCombinedNodeCluster(t, testName, dir, nNodes, c)
 	defer nodes.Close()
 
 	createDatabase(t, testName, nodes, "opentsdb")
 	createRetentionPolicy(t, testName, nodes, "opentsdb", "raw", len(nodes))
 
-	// Connect to the graphite endpoint we just spun up
-	conn, err := net.Dial("tcp", o.ListenAddress(c.BindAddress))
+	// Connect to the openTSDB endpoint we just spun up
+	host := nodes[0].node.OpenTSDBServer.Addr().String()
+	conn, err := net.Dial("tcp", host)
 	if err != nil {
 		t.Fatal(err)
 		return
@@ -1855,16 +2070,17 @@ func Test_ServerOpenTSDBIntegration_WithTags(t *testing.T) {
 		return
 	}
 
-	expected := fmt.Sprintf(`{"results":[{"series":[{"name":"cpu","columns":["time","cpu"],"values":[["%s",20]]}]}]}`, now.Format(time.RFC3339Nano))
+	expected := fmt.Sprintf(`{"results":[{"series":[{"name":"cpu","columns":["time","value"],"values":[["%s",20]]}]}]}`, now.Format(time.RFC3339Nano))
 
 	// query and wait for results
-	got, ok := queryAndWait(t, nodes, "opentsdb", `select * from "opentsdb"."raw".cpu where tag1='val3'`, expected, "", 2*time.Second)
+	got, ok, _ := queryAndWait(t, nodes, "opentsdb", `select * from "opentsdb"."raw".cpu where tag1='val3'`, expected, "", openTSDBTestTimeout)
 	if !ok {
 		t.Errorf(`Test "%s" failed, expected: %s, got: %s`, testName, expected, got)
 	}
 }
 
 func Test_ServerOpenTSDBIntegration_BadData(t *testing.T) {
+	t.Parallel()
 	if testing.Short() {
 		t.Skip()
 	}
@@ -1873,23 +2089,27 @@ func Test_ServerOpenTSDBIntegration_BadData(t *testing.T) {
 	dir := tempfile()
 	now := time.Now().UTC().Round(time.Second)
 	c, _ := main.NewTestConfig()
+	c.Port = 0
+	c.Admin.Enabled = false
 	o := main.OpenTSDB{
-		Port:            4244,
+		Addr:            "127.0.0.1",
+		Port:            0,
 		Enabled:         true,
 		Database:        "opentsdb",
 		RetentionPolicy: "raw",
 	}
 	c.OpenTSDB = o
 
-	t.Logf("OpenTSDB Connection String: %s\n", o.ListenAddress(c.BindAddress))
+	t.Logf("OpenTSDB Connection String: %s\n", o.ListenAddress())
 	nodes := createCombinedNodeCluster(t, testName, dir, nNodes, c)
 	defer nodes.Close()
 
 	createDatabase(t, testName, nodes, "opentsdb")
 	createRetentionPolicy(t, testName, nodes, "opentsdb", "raw", len(nodes))
 
-	// Connect to the graphite endpoint we just spun up
-	conn, err := net.Dial("tcp", o.ListenAddress(c.BindAddress))
+	// Connect to the openTSDB endpoint we just spun up
+	host := nodes[0].node.OpenTSDBServer.Addr().String()
+	conn, err := net.Dial("tcp", host)
 	if err != nil {
 		t.Fatal(err)
 		return
@@ -1907,16 +2127,17 @@ func Test_ServerOpenTSDBIntegration_BadData(t *testing.T) {
 		return
 	}
 
-	expected := fmt.Sprintf(`{"results":[{"series":[{"name":"cpu","columns":["time","cpu"],"values":[["%s",10]]}]}]}`, now.Format(time.RFC3339Nano))
+	expected := fmt.Sprintf(`{"results":[{"series":[{"name":"cpu","columns":["time","value"],"values":[["%s",10]]}]}]}`, now.Format(time.RFC3339Nano))
 
 	// query and wait for results
-	got, ok := queryAndWait(t, nodes, "opentsdb", `select * from "opentsdb"."raw".cpu`, expected, "", 2*time.Second)
+	got, ok, _ := queryAndWait(t, nodes, "opentsdb", `select * from "opentsdb"."raw".cpu`, expected, "", openTSDBTestTimeout)
 	if !ok {
 		t.Errorf(`Test "%s" failed, expected: %s, got: %s`, testName, expected, got)
 	}
 }
 
 func TestSeparateBrokerDataNode(t *testing.T) {
+	t.Parallel()
 	testName := "TestSeparateBrokerDataNode"
 	if testing.Short() {
 		t.Skip("Skipping", testName)
@@ -1934,12 +2155,15 @@ func TestSeparateBrokerDataNode(t *testing.T) {
 	_ = os.RemoveAll(tmpDataDir)
 
 	brokerConfig := main.NewConfig()
+	brokerConfig.Port = 0
+	brokerConfig.Admin.Enabled = false
 	brokerConfig.Data.Enabled = false
 	brokerConfig.Broker.Dir = filepath.Join(tmpBrokerDir, strconv.Itoa(brokerConfig.Port))
 	brokerConfig.ReportingDisabled = true
 
 	dataConfig := main.NewConfig()
-	dataConfig.Port = 9086
+	dataConfig.Port = 0
+	dataConfig.Admin.Enabled = false
 	dataConfig.Broker.Enabled = false
 	dataConfig.Data.Dir = filepath.Join(tmpDataDir, strconv.Itoa(dataConfig.Port))
 	dataConfig.ReportingDisabled = true
@@ -1964,6 +2188,7 @@ func TestSeparateBrokerDataNode(t *testing.T) {
 }
 
 func TestSeparateBrokerTwoDataNodes(t *testing.T) {
+	t.Parallel()
 	testName := "TestSeparateBrokerTwoDataNodes"
 	if testing.Short() {
 		t.Skip("Skipping", testName)
@@ -1982,8 +2207,10 @@ func TestSeparateBrokerTwoDataNodes(t *testing.T) {
 
 	// Start a single broker node
 	brokerConfig := main.NewConfig()
+	brokerConfig.Port = 0
+	brokerConfig.Admin.Enabled = false
 	brokerConfig.Data.Enabled = false
-	brokerConfig.Broker.Dir = filepath.Join(tmpBrokerDir, strconv.Itoa(brokerConfig.Port))
+	brokerConfig.Broker.Dir = filepath.Join(tmpBrokerDir, "1")
 	brokerConfig.ReportingDisabled = true
 
 	brokerCmd := main.NewRunCommand()
@@ -1999,9 +2226,10 @@ func TestSeparateBrokerTwoDataNodes(t *testing.T) {
 
 	// Star the first data node and join the broker
 	dataConfig1 := main.NewConfig()
-	dataConfig1.Port = 9086
+	dataConfig1.Port = 0
+	dataConfig1.Admin.Enabled = false
 	dataConfig1.Broker.Enabled = false
-	dataConfig1.Data.Dir = filepath.Join(tmpDataDir, strconv.Itoa(dataConfig1.Port))
+	dataConfig1.Data.Dir = filepath.Join(tmpDataDir, "1")
 	dataConfig1.ReportingDisabled = true
 
 	dataCmd1 := main.NewRunCommand()
@@ -2015,9 +2243,10 @@ func TestSeparateBrokerTwoDataNodes(t *testing.T) {
 
 	// Join data node 2 to single broker and first data node
 	dataConfig2 := main.NewConfig()
-	dataConfig2.Port = 10086
+	dataConfig2.Port = 0
+	dataConfig2.Admin.Enabled = false
 	dataConfig2.Broker.Enabled = false
-	dataConfig2.Data.Dir = filepath.Join(tmpDataDir, strconv.Itoa(dataConfig2.Port))
+	dataConfig2.Data.Dir = filepath.Join(tmpDataDir, "2")
 	dataConfig2.ReportingDisabled = true
 
 	dataCmd2 := main.NewRunCommand()

@@ -7,6 +7,7 @@ import (
 )
 
 func TestParseCommand_CommandsExist(t *testing.T) {
+	t.Parallel()
 	c := main.CommandLine{}
 	tests := []struct {
 		cmd string
@@ -26,6 +27,7 @@ func TestParseCommand_CommandsExist(t *testing.T) {
 }
 
 func TestParseCommand_TogglePretty(t *testing.T) {
+	t.Parallel()
 	c := main.CommandLine{}
 	if c.Pretty {
 		t.Fatalf(`Pretty should be false.`)
@@ -41,6 +43,7 @@ func TestParseCommand_TogglePretty(t *testing.T) {
 }
 
 func TestParseCommand_Exit(t *testing.T) {
+	t.Parallel()
 	c := main.CommandLine{}
 	tests := []struct {
 		cmd string
@@ -59,6 +62,7 @@ func TestParseCommand_Exit(t *testing.T) {
 }
 
 func TestParseCommand_Use(t *testing.T) {
+	t.Parallel()
 	c := main.CommandLine{}
 	tests := []struct {
 		cmd string

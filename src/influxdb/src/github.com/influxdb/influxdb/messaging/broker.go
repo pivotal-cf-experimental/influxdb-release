@@ -3,6 +3,7 @@ package messaging
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -24,6 +25,24 @@ import (
 // only occurs when the reader is at the end of all the data.
 const DefaultPollInterval = 100 * time.Millisecond
 
+const DefaultTruncationInterval = 10 * time.Minute
+
+// DefaultMaxTopicSize is the largest a topic can get before truncation.
+const DefaultMaxTopicSize = 1024 * 1024 * 1024 // 1GB
+
+// DefaultMaxSegmentSize is the largest a segment can get before starting a new segment.
+const DefaultMaxSegmentSize = 10 * 1024 * 1024 // 10MB
+
+var (
+	// ErrTopicTruncated is returned when topic data is unavailable due to truncation.
+	ErrTopicTruncated = errors.New("topic truncated")
+
+	// ErrTopicNodesNotFound is returned when requested topic data has been truncated
+	// but there are no nodes in the cluster that can provide a replica. This is a system
+	// failure and should not occur on a healthy replicated system.
+	ErrTopicNodesNotFound = errors.New("topic nodes not found")
+)
+
 // Broker represents distributed messaging system segmented into topics.
 // Each topic represents a linear series of events.
 type Broker struct {
@@ -33,6 +52,14 @@ type Broker struct {
 
 	meta   *bolt.DB          // metadata
 	topics map[uint64]*Topic // topics by id
+
+	TruncationInterval time.Duration
+	MaxTopicSize       int64 // Maximum size of a topic in bytes
+	MaxSegmentSize     int64 // Maximum size of a segment in bytes
+
+	// Goroutinte shutdown
+	done chan struct{}
+	wg   sync.WaitGroup
 
 	// Log is the distributed raft log that commands are applied to.
 	Log interface {
@@ -50,8 +77,12 @@ type Broker struct {
 // NewBroker returns a new instance of a Broker with default values.
 func NewBroker() *Broker {
 	b := &Broker{
-		topics: make(map[uint64]*Topic),
-		Logger: log.New(os.Stderr, "[broker] ", log.LstdFlags),
+		topics:             make(map[uint64]*Topic),
+		Logger:             log.New(os.Stderr, "[broker] ", log.LstdFlags),
+		TruncationInterval: DefaultTruncationInterval,
+		MaxTopicSize:       DefaultMaxTopicSize,
+		MaxSegmentSize:     DefaultMaxSegmentSize,
+		done:               make(chan struct{}),
 	}
 	return b
 }
@@ -165,6 +196,9 @@ func (b *Broker) Open(path string) error {
 			return fmt.Errorf("open topics: %s", err)
 		}
 
+		// Start periodic deletion of replicated topic segments.
+		b.startTopicTruncation()
+
 		return nil
 	}(); err != nil {
 		_ = b.close()
@@ -189,6 +223,7 @@ func (b *Broker) openTopics() error {
 			return fmt.Errorf("open topic: id=%d, err=%s", t.id, err)
 		}
 		b.topics[t.id] = t
+		b.topics[t.id].MaxSegmentSize = b.MaxSegmentSize
 	}
 
 	// Retrieve the highest index across all topics.
@@ -224,6 +259,11 @@ func (b *Broker) close() error {
 	// Close all topics.
 	b.closeTopics()
 
+	// Shutdown all goroutines.
+	close(b.done)
+	b.wg.Wait()
+	b.done = nil
+
 	return nil
 }
 
@@ -233,6 +273,41 @@ func (b *Broker) closeTopics() {
 		_ = t.Close()
 	}
 	b.topics = make(map[uint64]*Topic)
+}
+
+// startTopicTruncation starts periodic topic truncation.
+func (b *Broker) startTopicTruncation() {
+	b.wg.Add(1)
+	go func() {
+		defer b.wg.Done()
+		tick := time.NewTicker(b.TruncationInterval)
+		defer tick.Stop()
+		for {
+			select {
+			case <-tick.C:
+				b.TruncateTopics()
+			case <-b.done:
+				return
+			}
+		}
+	}()
+}
+
+// TruncateTopics forces topics to truncate such that they are equal to
+// or less than the requested size, if possible.
+func (b *Broker) TruncateTopics() {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	b.Logger.Printf("executing truncation check for %d topic(s)", len(b.topics))
+	for _, t := range b.topics {
+		if s, d, err := t.Truncate(b.MaxTopicSize); err != nil {
+			b.Logger.Printf("error truncating topic %s: %s", t.Path(), err.Error())
+		} else if s > 0 {
+			b.Logger.Printf("topic %s, %d segments, %d bytes, deleted", t.Path(), s, d)
+		}
+	}
+	return
 }
 
 // SetMaxIndex sets the highest index applied by the broker.
@@ -255,6 +330,21 @@ func (b *Broker) setMaxIndex(index uint64) error {
 	b.index = index
 
 	return nil
+}
+
+// URLsForTopic returns a slice of URLs from where previously replicaed
+// data for a given topic may be retrieved. The nodes at the URL will have
+// data up to at least the given index. These URLs are provided when a node
+// requests topic data that has been truncated.
+func (b *Broker) DataURLsForTopic(id, index uint64) []url.URL {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	t := b.topics[id]
+	if t == nil {
+		return nil
+	}
+	return t.DataURLsForIndex(index)
 }
 
 // WriteTo writes a snapshot of the broker to w.
@@ -386,6 +476,7 @@ func (b *Broker) ReadFrom(r io.Reader) (int64, error) {
 	// Copy topic files from snapshot to local disk.
 	for _, st := range sh.Topics {
 		t := NewTopic(st.ID, b.topicPath(st.ID))
+		t.MaxSegmentSize = b.MaxSegmentSize
 
 		// Create topic directory.
 		if err := os.MkdirAll(t.Path(), 0777); err != nil {
@@ -479,7 +570,7 @@ func (b *Broker) TopicReader(topicID, index uint64, streaming bool) interface {
 // SetTopicMaxIndex updates the highest replicated index for a topic and data URL.
 // If a higher index is already set on the topic then the call is ignored.
 // This index is only held in memory and is used for topic segment reclamation.
-// The higheset replciated index per data URL is tracked separately from the current index
+// The higheset replicated index per data URL is tracked separately from the current index
 func (b *Broker) SetTopicMaxIndex(topicID, index uint64, u url.URL) error {
 	_, err := b.Publish(&Message{
 		Type: SetTopicMaxIndexMessageType,
@@ -491,13 +582,9 @@ func (b *Broker) SetTopicMaxIndex(topicID, index uint64, u url.URL) error {
 func (b *Broker) applySetTopicMaxIndex(m *Message) {
 	topicID, index, u := unmarshalTopicIndex(m.Data)
 
-	// Set index if it's not already set higher.
+	// Track the highest replicated index for the topic, per data node URL.
 	if t := b.topics[topicID]; t != nil {
-		t.mu.Lock()
-		defer t.mu.Unlock()
-
-		// Track the highest replicated index per data node URL
-		t.indexByURL[u] = index
+		t.SetIndexForURL(index, u)
 	}
 }
 
@@ -545,6 +632,7 @@ func (b *Broker) Apply(m *Message) error {
 		t := b.topics[m.TopicID]
 		if t == nil {
 			t = NewTopic(m.TopicID, b.topicPath(m.TopicID))
+			t.MaxSegmentSize = b.MaxSegmentSize
 			if err := t.Open(); err != nil {
 				return fmt.Errorf("open topic: %s", err)
 			}
@@ -625,16 +713,13 @@ func (fsm *RaftFSM) Apply(e *raft.LogEntry) error {
 	return nil
 }
 
-// DefaultMaxSegmentSize is the largest a segment can get before starting a new segment.
-const DefaultMaxSegmentSize = 10 * 1024 * 1024 // 10MB
-
 // topic represents a single named queue of messages.
 // Each topic is identified by a unique path.
 //
 // Topics write their entries to segmented log files which contain a
 // contiguous range of entries.
 type Topic struct {
-	mu    sync.Mutex
+	mu    sync.RWMutex
 	id    uint64 // unique identifier
 	index uint64 // current index
 	path  string // on-disk path
@@ -666,17 +751,25 @@ func (t *Topic) ID() uint64 { return t.id }
 // Path returns the topic path.
 func (t *Topic) Path() string { return t.path }
 
+// TombstonePath returns the path of the tomstone file.
+func (t *Topic) TombstonePath() string { return filepath.Join(t.path, "tombstone") }
+
+// Truncated returns whether the topic has even been truncated.
+func (t *Topic) Truncated() bool {
+	return tombstoneExists(t.path)
+}
+
 // Index returns the highest replicated index for the topic.
 func (t *Topic) Index() uint64 {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 	return t.index
 }
 
 // DataURLs returns the data node URLs subscribed to this topic
 func (t *Topic) DataURLs() []url.URL {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 	var urls []url.URL
 	for u, _ := range t.indexByURL {
 		urls = append(urls, u)
@@ -684,17 +777,38 @@ func (t *Topic) DataURLs() []url.URL {
 	return urls
 }
 
-// IndexForURL returns the highest index replicated for a given data URL.
-func (t *Topic) IndexForURL(u url.URL) uint64 {
+// DataURLsForIndex returns the data node URLs subscribed to this topic that have
+// replicated at least up to the given index.
+func (t *Topic) DataURLsForIndex(index uint64) []url.URL {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	var urls []url.URL
+	for u, idx := range t.indexByURL {
+		if idx >= index {
+			urls = append(urls, u)
+		}
+	}
+	return urls
+}
+
+// IndexForURL returns the highest index replicated for a given data URL.
+func (t *Topic) IndexForURL(u url.URL) uint64 {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 	return t.indexByURL[u]
+}
+
+// SetIndexForURL sets the replicated index for a given data URL.
+func (t *Topic) SetIndexForURL(index uint64, u url.URL) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.indexByURL[u] = index
 }
 
 // SegmentPath returns the path to a segment starting with a given log index.
 func (t *Topic) SegmentPath(index uint64) string {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 	return t.segmentPath(index)
 }
 
@@ -818,6 +932,80 @@ func (t *Topic) WriteMessage(m *Message) error {
 	return nil
 }
 
+// Truncate attempts to delete topic segments such that the total size of the topic on-disk
+// is equal to or less-than maxSize. Returns the number of segments and bytes deleted, and
+// error if any. This function is not guaranteed to be performant.
+func (t *Topic) Truncate(maxSize int64) (int, int64, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	nSegmentsDeleted := 0
+
+	segments, err := ReadSegments(t.Path())
+	if err != nil {
+		return 0, 0, err
+	}
+
+	totalSize, err := segments.Size()
+	if err != nil {
+		return 0, 0, err
+	}
+
+	// Find the highest-replicated index, this is a condition for deletion of segments
+	// within this topic.
+	var highestIndex uint64
+	for _, idx := range t.indexByURL {
+		if idx > highestIndex {
+			highestIndex = idx
+		}
+	}
+
+	var nBytesDeleted int64
+	for {
+		if (totalSize - nBytesDeleted) <= maxSize {
+			break
+		}
+
+		// More than 2 segments are needed for current writes and replication checks.
+		if len(segments) <= 2 {
+			break
+		}
+
+		// Attempt deletion of oldest segment in topic. First and second segment needed
+		// for this operation.
+		first := segments[0]
+		second := segments[1]
+
+		// The first segment can only be deleted if the last index in that segment has
+		// been replicated. The most efficient way to check this is to ensure that the
+		// first index of the subsequent segment has been replicated.
+		if second.Index > highestIndex {
+			// No guarantee first segment has been replicated.
+			break
+		}
+
+		// Deletion can proceed!
+		size, err := first.Size()
+		if err != nil {
+			return nSegmentsDeleted, nBytesDeleted, err
+		}
+		if err = os.Remove(first.Path); err != nil {
+			return nSegmentsDeleted, nBytesDeleted, err
+		}
+		nSegmentsDeleted += 1
+		nBytesDeleted += size
+		segments = segments[1:]
+
+		// Create tombstone to indicate that the topic has been truncated at least once.
+		f, err := os.Create(t.TombstonePath())
+		if err != nil {
+			return nSegmentsDeleted, nBytesDeleted, err
+		}
+		f.Close()
+	}
+
+	return nSegmentsDeleted, nBytesDeleted, err
+}
+
 // Topics represents a list of topics sorted by id.
 type Topics []*Topic
 
@@ -887,6 +1075,18 @@ func (a Segments) Last() *Segment {
 	return a[len(a)-1]
 }
 
+func (a Segments) Size() (int64, error) {
+	var size int64
+	for _, s := range a {
+		sz, err := s.Size()
+		if err != nil {
+			return 0, nil
+		}
+		size += sz
+	}
+	return size, nil
+}
+
 func (a Segments) Len() int           { return len(a) }
 func (a Segments) Less(i, j int) bool { return a[i].Index < a[j].Index }
 func (a Segments) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
@@ -934,14 +1134,27 @@ func ReadSegmentByIndex(path string, index uint64) (*Segment, error) {
 		return nil, fmt.Errorf("read segments: %s", err)
 	}
 
-	// If there are no segments then ignore.
-	// If index is zero then start from the first segment.
-	// If index is less than the first segment range then return error.
+	// Determine if this topic has been truncated.
+	truncated := tombstoneExists(path)
+
+	// If the requested index is less than that available, one of two things will
+	// happen. If the topic has been truncated it means that topic data may exist
+	// somewhere on the cluster that is not available here. Therefore this broker
+	// cannot provide the data. If truncation has never taken place however, then
+	// this broker can safely provide whatever data it has.
+
 	if len(segments) == 0 {
+		if truncated {
+			return nil, ErrTopicTruncated
+		}
 		return nil, nil
-	} else if index == 0 {
-		return segments[0], nil
-	} else if index < segments[0].Index {
+	}
+
+	// Is requested index lower than the broker can provide?
+	if index < segments[0].Index {
+		if truncated {
+			return nil, ErrTopicTruncated
+		}
 		return segments[0], nil
 	}
 
@@ -1041,7 +1254,7 @@ func (r *TopicReader) Read(p []byte) (int, error) {
 		if err == ErrReaderClosed {
 			return 0, io.EOF
 		} else if err != nil {
-			return 0, fmt.Errorf("file: %s", err)
+			return 0, err
 		} else if f == nil {
 			if r.streaming {
 				time.Sleep(r.PollInterval)
@@ -1087,6 +1300,8 @@ func (r *TopicReader) File() (*os.File, error) {
 		segment, err := ReadSegmentByIndex(r.path, r.index)
 		if os.IsNotExist(err) {
 			return nil, nil
+		} else if err == ErrTopicTruncated {
+			return nil, err
 		} else if err != nil {
 			return nil, fmt.Errorf("segment by index: %s", err)
 		} else if segment == nil {
@@ -1332,7 +1547,7 @@ func (dec *MessageDecoder) Decode(m *Message) error {
 		warnf("unexpected eof(0): len=%d, n=%d, err=%s", len(b[:]), n, err)
 		return err
 	} else if err != nil {
-		return fmt.Errorf("read header: %s", err)
+		return err
 	}
 
 	// Read checksum.
@@ -1364,6 +1579,14 @@ func (dec *MessageDecoder) Decode(m *Message) error {
 	}
 
 	return nil
+}
+
+// tombstoneExists returns whether the given directory contains a tombstone
+func tombstoneExists(path string) bool {
+	if _, err := os.Stat(filepath.Join(path, "tombstone")); os.IsNotExist(err) {
+		return false
+	}
+	return true
 }
 
 // UnmarshalMessage decodes a byte slice into a message.

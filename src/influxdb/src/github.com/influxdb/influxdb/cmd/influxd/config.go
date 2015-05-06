@@ -6,7 +6,6 @@ import (
 	"log"
 	"net"
 	"net/url"
-	"os"
 	"os/user"
 	"path/filepath"
 	"strconv"
@@ -16,7 +15,6 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/influxdb/influxdb/collectd"
 	"github.com/influxdb/influxdb/graphite"
-	"github.com/influxdb/influxdb/opentsdb"
 )
 
 const (
@@ -33,6 +31,12 @@ const (
 	// DefaultAPIReadTimeout represents the duration before an API request times out.
 	DefaultAPIReadTimeout = 5 * time.Second
 
+	// DefaultHostName represents the default host name to use if it is never provided
+	DefaultHostName = "localhost"
+
+	// DefaultBindAddress represents the bind address to use if none is specified
+	DefaultBindAddress = "0.0.0.0"
+
 	// DefaultClusterPort represents the default port the cluster runs ons.
 	DefaultClusterPort = 8086
 
@@ -42,15 +46,30 @@ const (
 	// DefaultDataEnabled is the default for starting a node as a data node
 	DefaultDataEnabled = true
 
-	// DefaultSnapshotBindAddress is the default bind address to serve snapshots from.
-	DefaultSnapshotBindAddress = "127.0.0.1"
-
-	// DefaultSnapshotPort is the default port to serve snapshots from.
-	DefaultSnapshotPort = 8087
-
 	// DefaultRetentionCreatePeriod represents how often the server will check to see if new
 	// shard groups need to be created in advance for writing
 	DefaultRetentionCreatePeriod = 45 * time.Minute
+
+	// DefaultBrokerTruncationInterval is the default period between truncating topics.
+	DefaultBrokerTruncationInterval = 10 * time.Minute
+
+	// DefaultMaxTopicSize is the default maximum size in bytes a segment can consume on disk of a broker.
+	DefaultBrokerMaxSegmentSize = 10 * 1024 * 1024
+
+	// DefaultMaxTopicSize is the default maximum size in bytes a topic can consume on disk of a broker.
+	DefaultBrokerMaxTopicSize = 5 * DefaultBrokerMaxSegmentSize
+
+	// DefaultRaftApplyInterval is the period between applying commited Raft log entries.
+	DefaultRaftApplyInterval = 10 * time.Millisecond
+
+	// DefaultRaftElectionTimeout is the default Leader Election timeout.
+	DefaultRaftElectionTimeout = 1 * time.Second
+
+	// DefaultRaftHeartbeatInterval is the interval between leader heartbeats.
+	DefaultRaftHeartbeatInterval = 100 * time.Millisecond
+
+	// DefaultRaftReconnectTimeout is the default wait time between reconnections.
+	DefaultRaftReconnectTimeout = 10 * time.Millisecond
 
 	// DefaultGraphiteDatabaseName is the default Graphite database if none is specified
 	DefaultGraphiteDatabaseName = "graphite"
@@ -94,22 +113,30 @@ const (
 
 var DefaultSnapshotURL = url.URL{
 	Scheme: "http",
-	Host:   net.JoinHostPort(DefaultSnapshotBindAddress, strconv.Itoa(DefaultSnapshotPort)),
+	Host:   net.JoinHostPort("127.0.0.1", strconv.Itoa(DefaultClusterPort)),
 }
 
 // Broker represents the configuration for a broker node
 type Broker struct {
-	Dir     string   `toml:"dir"`
-	Enabled bool     `toml:"enabled"`
-	Timeout Duration `toml:"election-timeout"`
+	Dir                string   `toml:"dir"`
+	Enabled            bool     `toml:"enabled"`
+	TruncationInterval Duration `toml:"truncation-interval"`
+	MaxTopicSize       int64    `toml:"max-topic-size"`
+	MaxSegmentSize     int64    `toml:"max-segment-size"`
+}
+
+// Raft represents the Raft configuration for broker nodes.
+type Raft struct {
+	ApplyInterval     Duration `toml:"apply-interval"`
+	ElectionTimeout   Duration `toml:"election-timeout"`
+	HeartbeatInterval Duration `toml:"heartbeat-interval"`
+	ReconnectTimeout  Duration `toml:"reconnect-timeout"`
 }
 
 // Snapshot represents the configuration for a snapshot service. Snapshot configuration
 // is only valid for data nodes.
 type Snapshot struct {
-	Enabled     bool   `toml:"enabled"`
-	BindAddress string `toml:"bind-address"`
-	Port        int    `toml:"port"`
+	Enabled bool `toml:"enabled"`
 }
 
 // Data represents the configuration for a data node
@@ -170,11 +197,14 @@ type Config struct {
 
 	Broker Broker `toml:"broker"`
 
+	Raft Raft `toml:"raft"`
+
 	Data Data `toml:"data"`
 
 	Snapshot Snapshot `toml:"snapshot"`
 
 	Logging struct {
+		HTTPAccess   bool `toml:"http-access"`
 		WriteTracing bool `toml:"write-tracing"`
 		RaftTracing  bool `toml:"raft-tracing"`
 	} `toml:"logging"`
@@ -224,9 +254,9 @@ type Config struct {
 // NewConfig returns an instance of Config with reasonable defaults.
 func NewConfig() *Config {
 	c := &Config{}
+	c.Hostname = DefaultHostName
+	c.BindAddress = DefaultBindAddress
 	c.Port = DefaultClusterPort
-
-	c.HTTPAPI.Port = DefaultClusterPort
 
 	c.Data.Enabled = DefaultDataEnabled
 	c.Broker.Enabled = DefaultBrokerEnabled
@@ -236,8 +266,9 @@ func NewConfig() *Config {
 	c.Data.RetentionCheckPeriod = Duration(DefaultRetentionCheckPeriod)
 	c.Data.RetentionCreatePeriod = Duration(DefaultRetentionCreatePeriod)
 
-	c.Snapshot.BindAddress = DefaultSnapshotBindAddress
-	c.Snapshot.Port = DefaultSnapshotPort
+	c.Logging.HTTPAccess = true
+	c.Logging.WriteTracing = false
+	c.Logging.RaftTracing = false
 
 	c.Monitoring.Enabled = false
 	c.Monitoring.WriteInterval = Duration(DefaultStatisticsWriteInterval)
@@ -246,10 +277,14 @@ func NewConfig() *Config {
 	c.ContinuousQuery.ComputeRunsPerInterval = DefaultContinuousQueryComputeRunsPerInterval
 	c.ContinuousQuery.ComputeNoMoreThan = Duration(DefaultContinousQueryComputeNoMoreThan)
 
-	// Detect hostname (or set to localhost).
-	if c.Hostname, _ = os.Hostname(); c.Hostname == "" {
-		c.Hostname = "localhost"
-	}
+	c.Broker.TruncationInterval = Duration(DefaultBrokerTruncationInterval)
+	c.Broker.MaxTopicSize = DefaultBrokerMaxTopicSize
+	c.Broker.MaxSegmentSize = DefaultBrokerMaxSegmentSize
+
+	c.Raft.ApplyInterval = Duration(DefaultRaftApplyInterval)
+	c.Raft.ElectionTimeout = Duration(DefaultRaftElectionTimeout)
+	c.Raft.HeartbeatInterval = Duration(DefaultRaftHeartbeatInterval)
+	c.Raft.ReconnectTimeout = Duration(DefaultRaftReconnectTimeout)
 
 	// FIX(benbjohnson): Append where the udp servers are actually used.
 	// config.UDPServers = append(config.UDPServers, UDPInputConfig{
@@ -275,6 +310,11 @@ func NewTestConfig() (*Config, error) {
 	c.Broker.Enabled = true
 	c.Broker.Dir = filepath.Join(u.HomeDir, ".influxdb/broker")
 
+	c.Raft.ApplyInterval = Duration(DefaultRaftApplyInterval)
+	c.Raft.ElectionTimeout = Duration(DefaultRaftElectionTimeout)
+	c.Raft.HeartbeatInterval = Duration(DefaultRaftHeartbeatInterval)
+	c.Raft.ReconnectTimeout = Duration(DefaultRaftReconnectTimeout)
+
 	c.Data.Enabled = true
 	c.Data.Dir = filepath.Join(u.HomeDir, ".influxdb/data")
 
@@ -289,21 +329,23 @@ func NewTestConfig() (*Config, error) {
 
 // APIAddr returns the TCP binding address for the API server.
 func (c *Config) APIAddr() string {
+	// Default to cluster bind address if not overriden
 	ba := c.BindAddress
 	if c.HTTPAPI.BindAddress != "" {
 		ba = c.HTTPAPI.BindAddress
 	}
-	return net.JoinHostPort(ba, strconv.Itoa(c.HTTPAPI.Port))
+
+	// Default to cluster port if not overridden
+	bp := c.Port
+	if c.HTTPAPI.Port != 0 {
+		bp = c.HTTPAPI.Port
+	}
+	return net.JoinHostPort(ba, strconv.Itoa(bp))
 }
 
 // APIAddrUDP returns the UDP address for the series listener.
 func (c *Config) APIAddrUDP() string {
 	return net.JoinHostPort(c.UDP.BindAddress, strconv.Itoa(c.UDP.Port))
-}
-
-// SnapshotAddr returns the TCP binding address for the snapshot handler.
-func (c *Config) SnapshotAddr() string {
-	return net.JoinHostPort(c.Snapshot.BindAddress, strconv.Itoa(c.Snapshot.Port))
 }
 
 // ClusterAddr returns the binding address for the cluster
@@ -461,7 +503,7 @@ func (c *Collectd) ConnectionString(defaultBindAddr string) string {
 
 type Graphite struct {
 	BindAddress string `toml:"bind-address"`
-	Port        uint16 `toml:"port"`
+	Port        int    `toml:"port"`
 
 	Database      string `toml:"database"`
 	Enabled       bool   `toml:"enabled"`
@@ -471,21 +513,8 @@ type Graphite struct {
 }
 
 // ConnnectionString returns the connection string for this Graphite config in the form host:port.
-func (g *Graphite) ConnectionString(defaultBindAddr string) string {
-
-	addr := g.BindAddress
-	// If no address specified, use default.
-	if addr == "" {
-		addr = defaultBindAddr
-	}
-
-	port := g.Port
-	// If no port specified, use default.
-	if port == 0 {
-		port = graphite.DefaultGraphitePort
-	}
-
-	return fmt.Sprintf("%s:%d", addr, port)
+func (g *Graphite) ConnectionString() string {
+	return net.JoinHostPort(g.BindAddress, strconv.Itoa(g.Port))
 }
 
 // NameSeparatorString returns the character separating fields for Graphite data, or the default
@@ -528,17 +557,6 @@ func (o OpenTSDB) DatabaseString() string {
 	return o.Database
 }
 
-func (o OpenTSDB) ListenAddress(defaultBindAddr string) string {
-	addr := o.Addr
-	// If no address specified, use default.
-	if addr == "" {
-		addr = defaultBindAddr
-	}
-
-	port := o.Port
-	// If no port specified, use default.
-	if port == 0 {
-		port = opentsdb.DefaultPort
-	}
-	return net.JoinHostPort(addr, strconv.Itoa(port))
+func (o OpenTSDB) ListenAddress() string {
+	return net.JoinHostPort(o.Addr, strconv.Itoa(o.Port))
 }

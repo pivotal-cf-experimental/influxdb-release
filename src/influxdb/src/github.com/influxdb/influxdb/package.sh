@@ -33,7 +33,6 @@
 AWS_FILE=~/aws.conf
 
 INSTALL_ROOT_DIR=/opt/influxdb
-INFLUXDB_RUN_DIR=/var/run/influxdb
 INFLUXDB_LOG_DIR=/var/log/influxdb
 INFLUXDB_DATA_DIR=/var/opt/influxdb
 CONFIG_ROOT_DIR=/etc/opt/influxdb
@@ -50,6 +49,7 @@ MAINTAINER=support@influxdb.com
 VENDOR=Influxdb
 DESCRIPTION="Distributed time-series database"
 
+GO_VERSION="go1.4.2"
 GOPATH_INSTALL=
 BINS=(
     influxd
@@ -81,6 +81,20 @@ check_gopath() {
     GOPATH_INSTALL=`echo $GOPATH | cut -d ':' -f 1`
     [ ! -d "$GOPATH_INSTALL" ] && echo "GOPATH_INSTALL is not a directory." && cleanup_exit 1
     echo "GOPATH ($GOPATH) looks sane, using $GOPATH_INSTALL for installation."
+}
+
+check_gvm() {
+    source $HOME/.gvm/scripts/gvm
+    which gvm
+    if [ $? -ne 0 ]; then
+        echo "gvm not found -- aborting."
+        cleanup_exit $1
+    fi
+    gvm use $GO_VERSION
+    if [ $? -ne 0 ]; then
+        echo "gvm cannot find Go version $GO_VERSION -- aborting."
+        cleanup_exit $1
+    fi
 }
 
 # check_clean_tree ensures that no source file is locally modified.
@@ -187,8 +201,6 @@ fi
 chown -R -L influxdb:influxdb $INSTALL_ROOT_DIR
 chmod -R a+rX $INSTALL_ROOT_DIR
 
-mkdir -p $INFLUXDB_RUN_DIR
-chown -R -L influxdb:influxdb $INFLUXDB_RUN_DIR
 mkdir -p $INFLUXDB_LOG_DIR
 chown -R -L influxdb:influxdb $INFLUXDB_LOG_DIR
 mkdir -p $INFLUXDB_DATA_DIR
@@ -210,6 +222,7 @@ fi
 
 echo -e "\nStarting package process...\n"
 
+check_gvm
 check_gopath
 check_clean_tree
 update_tree

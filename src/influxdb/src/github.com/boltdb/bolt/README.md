@@ -550,6 +550,11 @@ Here are a few things to note when evaluating and using Bolt:
   However, this is expected and the OS will release memory as needed. Bolt can
   handle databases much larger than the available physical RAM.
 
+* The data structures in the Bolt database are memory mapped so the data file
+  will be endian specific. This means that you cannot copy a Bolt file from a
+  little endian machine to a big endian machine and have it work. For most 
+  users this is not a concern since most modern CPUs are little endian.
+
 * Because of the way pages are laid out on disk, Bolt cannot truncate data files
   and return free pages back to the disk. Instead, Bolt maintains a free list
   of unused pages within its data file. These free pages can be reused by later
@@ -587,5 +592,6 @@ Below is a list of public, open source projects that use Bolt:
 * [SkyDB](https://github.com/skydb/sky) - Behavioral analytics database.
 * [Seaweed File System](https://github.com/chrislusf/weed-fs) - Highly scalable distributed key~file system with O(1) disk read.
 * [InfluxDB](http://influxdb.com) - Scalable datastore for metrics, events, and real-time analytics.
+* [Freehold](http://tshannon.bitbucket.org/freehold/) - An open, secure, and lightweight platform for your files and data.
 
 If you are using Bolt in a project please send a pull request to add it to the list.

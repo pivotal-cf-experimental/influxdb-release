@@ -50,55 +50,66 @@ type Handler struct {
 	routes                []route
 	mux                   *pat.PatternServeMux
 	requireAuthentication bool
+	snapshotEnabled       bool
 	version               string
 
-	Logger     *log.Logger
-	WriteTrace bool // Detailed logging of write path
+	Logger         *log.Logger
+	loggingEnabled bool // Log every HTTP access.
+	WriteTrace     bool // Detailed logging of write path
 }
 
-// NewClusterHandler is the http handler for cluster communcation endpoints
-func NewClusterHandler(s *influxdb.Server, requireAuthentication bool, version string) *Handler {
-	h := newHandler(s, requireAuthentication, version)
+// NewClusterHandler is the http handler for cluster communication endpoints
+func NewClusterHandler(s *influxdb.Server, requireAuthentication, snapshotEnabled, loggingEnabled bool, version string) *Handler {
+	h := newHandler(s, requireAuthentication, loggingEnabled, version)
+	h.snapshotEnabled = snapshotEnabled
 	h.SetRoutes([]route{
 		route{ // List data nodes
 			"data_nodes_index",
-			"GET", "/data_nodes", true, false, h.serveDataNodes,
+			"GET", "/data/data_nodes", true, false, h.serveDataNodes,
 		},
 		route{ // Create data node
 			"data_nodes_create",
-			"POST", "/data_nodes", true, false, h.serveCreateDataNode,
+			"POST", "/data/data_nodes", true, false, h.serveCreateDataNode,
 		},
 		route{ // Delete data node
 			"data_nodes_delete",
-			"DELETE", "/data_nodes/:id", true, false, h.serveDeleteDataNode,
+			"DELETE", "/data/data_nodes/:id", true, false, h.serveDeleteDataNode,
 		},
 		route{ // Metastore
 			"metastore",
-			"GET", "/metastore", false, false, h.serveMetastore,
+			"GET", "/data/metastore", false, false, h.serveMetastore,
+		},
+		route{ // Shards for peer-to-peer replication
+			"shard",
+			"GET", "/data/shard/:id", false, false, h.serveShard,
 		},
 		route{ // Tell data node to run CQs that should be run
 			"process_continuous_queries",
-			"POST", "/process_continuous_queries", false, false, h.serveProcessContinuousQueries,
+			"POST", "/data/process_continuous_queries", false, false, h.serveProcessContinuousQueries,
 		},
 		route{
 			"index", // Index.
-			"GET", "/", true, true, h.serveIndex,
+			"GET", "/data", true, true, h.serveIndex,
 		},
 		route{
 			"wait", // Wait.
-			"GET", "/wait/:index", true, true, h.serveWait,
+			"GET", "/data/wait/:index", true, true, h.serveWait,
 		},
 		route{
 			"run_mapper",
-			"POST", "/run_mapper", true, true, h.serveRunMapper,
+			"POST", "/data/run_mapper", true, true, h.serveRunMapper,
+		},
+		route{
+			"snapshot",
+			"GET", "/data/snapshot", true, true, h.serveSnapshot,
 		},
 	})
 	return h
 }
 
 // NewAPIHandler is the http handler for api endpoints
-func NewAPIHandler(s *influxdb.Server, requireAuthentication bool, version string) *Handler {
-	h := newHandler(s, requireAuthentication, version)
+func NewAPIHandler(s *influxdb.Server, requireAuthentication, loggingEnabled bool, version string) *Handler {
+	h := newHandler(s, requireAuthentication, loggingEnabled, version)
 	h.SetRoutes([]route{
 		route{
 			"query", // Query serving route.
@@ -132,12 +143,13 @@ func NewAPIHandler(s *influxdb.Server, requireAuthentication bool, version strin
 }
 
 // newHandler returns a new instance of Handler.
-func newHandler(s *influxdb.Server, requireAuthentication bool, version string) *Handler {
+func newHandler(s *influxdb.Server, requireAuthentication, loggingEnabled bool, version string) *Handler {
 	return &Handler{
 		server: s,
 		mux:    pat.New(),
 		requireAuthentication: requireAuthentication,
 		Logger:                log.New(os.Stderr, "[http] ", log.LstdFlags),
+		loggingEnabled:        loggingEnabled,
 		version:               version,
 	}
 }
@@ -163,7 +175,7 @@ func (h *Handler) SetRoutes(routes []route) {
 		handler = versionHeader(handler, h.version)
 		handler = cors(handler)
 		handler = requestID(handler)
-		if r.log {
+		if h.loggingEnabled && r.log {
 			handler = logging(handler, r.name, h.Logger)
 		}
 		handler = recovery(handler, r.name, h.Logger) // make sure recovery is always last
@@ -535,6 +547,24 @@ func (h *Handler) serveMetastore(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", `attachment; filename="meta"`)
 
 	if err := h.server.CopyMetastore(w); err != nil {
+		httpError(w, err.Error(), false, http.StatusInternalServerError)
+	}
+}
+
+// serveShard returns a copy of the requested shard.
+func (h *Handler) serveShard(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get(":id")
+	shardID, err := strconv.ParseUint(id, 10, 64)
+	if err != nil {
+		httpError(w, fmt.Sprintf("invalid shard ID %s: %s", id, err), false, http.StatusBadRequest)
+		return
+	}
+
+	// Set headers.
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, id))
+
+	if err := h.server.CopyShard(w, shardID); err != nil {
 		httpError(w, err.Error(), false, http.StatusInternalServerError)
 	}
 }
@@ -1031,4 +1061,17 @@ func (h *SnapshotHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		httpError(w, "error writing snapshot: "+err.Error(), false, http.StatusInternalServerError)
 		return
 	}
+}
+
+// serveSnapshot streams out a snapshot from the server.
+func (h *Handler) serveSnapshot(w http.ResponseWriter, r *http.Request) {
+	if !h.snapshotEnabled {
+		httpError(w, "not found", false, http.StatusNotFound)
+		return
+	}
+	sh := SnapshotHandler{
+		CreateSnapshotWriter: h.server.CreateSnapshotWriter,
+	}
+	sh.ServeHTTP(w, r)
+
 }

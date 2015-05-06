@@ -111,7 +111,7 @@ func Test_DecodeMetric(t *testing.T) {
 			timestamp: testTime,
 		},
 		{
-			test:      "sepeartor is . by default",
+			test:      "separator is . by default",
 			line:      `cpu.foo.bar 50 ` + strTime,
 			name:      "cpu",
 			tags:      map[string]string{"foo": "bar"},
@@ -119,7 +119,7 @@ func Test_DecodeMetric(t *testing.T) {
 			timestamp: testTime,
 		},
 		{
-			test:      "sepeartor is . if specified",
+			test:      "separator is . if specified",
 			separator: ".",
 			line:      `cpu.foo.bar 50 ` + strTime,
 			name:      "cpu",
@@ -128,7 +128,7 @@ func Test_DecodeMetric(t *testing.T) {
 			timestamp: testTime,
 		},
 		{
-			test:      "sepeartor is - if specified",
+			test:      "separator is - if specified",
 			separator: "-",
 			line:      `cpu-foo-bar 50 ` + strTime,
 			name:      "cpu",
@@ -137,7 +137,7 @@ func Test_DecodeMetric(t *testing.T) {
 			timestamp: testTime,
 		},
 		{
-			test:      "sepeartor is boo if specified",
+			test:      "separator is boo if specified",
 			separator: "boo",
 			line:      `cpuboofooboobar 50 ` + strTime,
 			name:      "cpu",
@@ -174,17 +174,17 @@ func Test_DecodeMetric(t *testing.T) {
 		{
 			test: "should fail parsing invalid float",
 			line: `cpu 50.554z 1419972457825`,
-			err:  `strconv.ParseFloat: parsing "50.554z": invalid syntax`,
+			err:  `field "cpu" value: strconv.ParseFloat: parsing "50.554z": invalid syntax`,
 		},
 		{
 			test: "should fail parsing invalid int",
 			line: `cpu 50z 1419972457825`,
-			err:  `strconv.ParseFloat: parsing "50z": invalid syntax`,
+			err:  `field "cpu" value: strconv.ParseFloat: parsing "50z": invalid syntax`,
 		},
 		{
 			test: "should fail parsing invalid time",
 			line: `cpu 50.554 14199724z57825`,
-			err:  `strconv.ParseFloat: parsing "14199724z57825": invalid syntax`,
+			err:  `field "cpu" timestamp: strconv.ParseFloat: parsing "14199724z57825": invalid syntax`,
 		},
 	}
 

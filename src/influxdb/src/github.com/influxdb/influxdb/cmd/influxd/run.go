@@ -19,7 +19,6 @@ import (
 	"github.com/influxdb/influxdb/admin"
 	"github.com/influxdb/influxdb/collectd"
 	"github.com/influxdb/influxdb/graphite"
-	"github.com/influxdb/influxdb/httpd"
 	"github.com/influxdb/influxdb/messaging"
 	"github.com/influxdb/influxdb/opentsdb"
 	"github.com/influxdb/influxdb/raft"
@@ -28,7 +27,6 @@ import (
 
 type RunCommand struct {
 	// The logger passed to the ticker during execution.
-	Logger    *log.Logger
 	logWriter *os.File
 	config    *Config
 	hostname  string
@@ -46,9 +44,31 @@ type Node struct {
 	DataNode *influxdb.Server
 	raftLog  *raft.Log
 
-	adminServer      *admin.Server
-	clusterListener  net.Listener // The cluster TCP listener
-	snapshotListener net.Listener
+	hostname string
+
+	adminServer     *admin.Server
+	clusterListener net.Listener      // The cluster TCP listener
+	apiListener     net.Listener      // The API TCP listener
+	GraphiteServers []graphite.Server // The Graphite Servers
+	OpenTSDBServer  *opentsdb.Server  // The OpenTSDB Server
+}
+
+func (s *Node) ClusterAddr() net.Addr {
+	return s.clusterListener.Addr()
+}
+
+func (s *Node) ClusterURL() *url.URL {
+	// Find out which port the cluster started on
+	_, p, e := net.SplitHostPort(s.ClusterAddr().String())
+	if e != nil {
+		panic(e)
+	}
+
+	h := net.JoinHostPort(s.hostname, p)
+	return &url.URL{
+		Scheme: "http",
+		Host:   h,
+	}
 }
 
 func (s *Node) Close() error {
@@ -56,16 +76,34 @@ func (s *Node) Close() error {
 		return err
 	}
 
+	if err := s.closeAPIListener(); err != nil {
+		return err
+	}
+
 	if err := s.closeAdminServer(); err != nil {
 		return err
 	}
 
-	if err := s.closeSnapshotListener(); err != nil {
-		return err
+	for _, g := range s.GraphiteServers {
+		if err := g.Close(); err != nil {
+			return err
+		}
+	}
+
+	if s.OpenTSDBServer != nil {
+		if err := s.OpenTSDBServer.Close(); err != nil {
+			return err
+		}
 	}
 
 	if s.DataNode != nil {
 		if err := s.DataNode.Close(); err != nil {
+			return err
+		}
+	}
+
+	if s.raftLog != nil {
+		if err := s.raftLog.Close(); err != nil {
 			return err
 		}
 	}
@@ -76,11 +114,6 @@ func (s *Node) Close() error {
 		}
 	}
 
-	if s.raftLog != nil {
-		if err := s.raftLog.Close(); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
@@ -98,26 +131,52 @@ func (s *Node) closeAdminServer() error {
 	return nil
 }
 
-func (s *Node) openClusterListener(addr string, h http.Handler) error {
+func (s *Node) openListener(desc, addr string, h http.Handler) (net.Listener, error) {
 	var err error
-	// We want to make sure we are spun up before we exit this function, so we manually listen and serve
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	s.clusterListener = listener
 	go func() {
-		err := http.Serve(s.clusterListener, h)
+		err := http.Serve(listener, h)
 
 		// The listener was closed so exit
 		// See https://github.com/golang/go/issues/4373
-		if operr, ok := err.(*net.OpError); ok && strings.Contains(operr.Err.Error(), "closed network connection") {
+		if strings.Contains(err.Error(), "closed") {
 			return
 		}
 		if err != nil {
-			log.Fatalf("TCP server failed to server on %s: %s", addr, err)
+			log.Fatalf("%s server failed to serve on %s: %s", desc, addr, err)
 		}
 	}()
+	return listener, nil
+
+}
+
+func (s *Node) openAPIListener(addr string, h http.Handler) error {
+	var err error
+	s.apiListener, err = s.openListener("API", addr, h)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Node) closeAPIListener() error {
+	var err error
+	if s.apiListener != nil {
+		err = s.apiListener.Close()
+		s.apiListener = nil
+	}
+	return err
+}
+
+func (s *Node) openClusterListener(addr string, h http.Handler) error {
+	var err error
+	s.clusterListener, err = s.openListener("Cluster", addr, h)
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -130,40 +189,35 @@ func (s *Node) closeClusterListener() error {
 	return err
 }
 
-func (s *Node) openSnapshotListener(addr string) error {
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		return err
-	}
-	s.snapshotListener = listener
-
-	// Start snapshot handler.
-	go func() {
-		err := http.Serve(s.snapshotListener,
-			&httpd.SnapshotHandler{
-				CreateSnapshotWriter: s.DataNode.CreateSnapshotWriter,
-			},
-		)
-		if !strings.Contains(err.Error(), "closed") {
-			log.Fatalf("snapshot server failed to serve on %s: %s", addr, err)
+func (cmd *RunCommand) ParseConfig(path string) error {
+	// Parse configuration file from disk.
+	if path != "" {
+		var err error
+		cmd.config, err = ParseConfigFile(path)
+		if err != nil {
+			return fmt.Errorf("error parsing configuration %s - %s\n", path, err)
 		}
-	}()
+		log.Printf("using configuration at: %s\n", path)
+	} else {
+		var err error
+		cmd.config, err = NewTestConfig()
+
+		if err != nil {
+			return fmt.Errorf("error parsing default config: %s\n", err)
+		}
+
+		log.Println("no configuration provided, using default settings")
+	}
+
+	// Override config properties.
+	if cmd.hostname != "" {
+		cmd.config.Hostname = cmd.hostname
+	}
+	cmd.node.hostname = cmd.config.Hostname
 	return nil
 }
 
-func (s *Node) closeSnapshotListener() error {
-	var err error
-	if s.snapshotListener != nil {
-		err = s.snapshotListener.Close()
-		s.snapshotListener = nil
-	}
-	return err
-}
-
 func (cmd *RunCommand) Run(args ...string) error {
-	// Set up logger.
-	cmd.Logger = log.New(os.Stderr, "", log.LstdFlags)
-
 	// Parse command flags.
 	fs := flag.NewFlagSet("", flag.ExitOnError)
 	var configPath, pidfile, hostname, join, cpuprofile, memprofile string
@@ -191,19 +245,9 @@ func (cmd *RunCommand) Run(args ...string) error {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	log.Printf("GOMAXPROCS set to %d", runtime.GOMAXPROCS(0))
 
-	var err error
-
-	// Parse configuration file from disk.
-	if configPath != "" {
-		cmd.config, err = parseConfig(configPath, hostname)
-	} else {
-		cmd.config, err = NewTestConfig()
-	}
-
-	if err != nil {
-		cmd.Logger.Fatal(err)
-	} else if configPath == "" {
-		cmd.Logger.Println("No config provided, using default settings")
+	// Parse config
+	if err := cmd.ParseConfig(configPath); err != nil {
+		log.Fatal(err)
 	}
 
 	// Use the config JoinURLs by default
@@ -223,16 +267,39 @@ func (cmd *RunCommand) Run(args ...string) error {
 
 // CheckConfig validates the configuration
 func (cmd *RunCommand) CheckConfig() {
+	// Set any defaults that aren't set
+	// TODO: bring more defaults in here instead of letting helpers do it
+
+	// Normalize Graphite configs
+	for i, _ := range cmd.config.Graphites {
+		if cmd.config.Graphites[i].BindAddress == "" {
+			cmd.config.Graphites[i].BindAddress = cmd.config.BindAddress
+		}
+		if cmd.config.Graphites[i].Port == 0 {
+			cmd.config.Graphites[i].Port = graphite.DefaultGraphitePort
+		}
+	}
+
+	// Normalize openTSDB config
+	if cmd.config.OpenTSDB.Addr == "" {
+		cmd.config.OpenTSDB.Addr = cmd.config.BindAddress
+	}
+
+	if cmd.config.OpenTSDB.Port == 0 {
+		cmd.config.OpenTSDB.Port = opentsdb.DefaultPort
+	}
+
+	// Validate that we have a sane config
 	if !(cmd.config.Data.Enabled || cmd.config.Broker.Enabled) {
-		cmd.Logger.Fatal("Node must be configured as a broker node, data node, or as both.  Run `influxd config` to generate a valid configuration.")
+		log.Fatal("Node must be configured as a broker node, data node, or as both.  Run `influxd config` to generate a valid configuration.")
 	}
 
 	if cmd.config.Broker.Enabled && cmd.config.Broker.Dir == "" {
-		cmd.Logger.Fatal("Broker.Dir must be specified.  Run `influxd config` to generate a valid configuration.")
+		log.Fatal("Broker.Dir must be specified.  Run `influxd config` to generate a valid configuration.")
 	}
 
 	if cmd.config.Data.Enabled && cmd.config.Data.Dir == "" {
-		cmd.Logger.Fatal("Data.Dir must be specified.  Run `influxd config` to generate a valid configuration.")
+		log.Fatal("Data.Dir must be specified.  Run `influxd config` to generate a valid configuration.")
 	}
 }
 
@@ -246,26 +313,20 @@ func (cmd *RunCommand) Open(config *Config, join string) *Node {
 	// Parse join urls from the --join flag.
 	joinURLs := parseURLs(join)
 
+	// Start the broker handler.
+	h := &Handler{Config: config}
+	if err := cmd.node.openClusterListener(cmd.config.ClusterAddr(), h); err != nil {
+		log.Fatalf("Cluster server failed to listen on %s. %s ", cmd.config.ClusterAddr(), err)
+	}
+	log.Printf("Cluster server listening on %s", cmd.node.ClusterAddr().String())
+
 	// Open broker & raft log, initialize or join as necessary.
 	if cmd.config.Broker.Enabled {
-		cmd.openBroker(joinURLs)
+		cmd.openBroker(joinURLs, h)
 		// If were running as a broker locally, always connect to it since it must
 		// be ready before we can start the data node.
-		joinURLs = []url.URL{cmd.node.Broker.URL()}
+		joinURLs = []url.URL{*cmd.node.ClusterURL()}
 	}
-
-	// Start the broker handler.
-	h := &Handler{
-		Config: config,
-		Broker: cmd.node.Broker,
-		Log:    cmd.node.raftLog,
-	}
-
-	err := cmd.node.openClusterListener(cmd.config.ClusterAddr(), h)
-	if err != nil {
-		log.Fatalf("TCP server failed to listen on %s. %s ", cmd.config.ClusterAddr(), err)
-	}
-	log.Printf("TCP server listening on %s", cmd.config.ClusterAddr())
 
 	var s *influxdb.Server
 	// Open server, initialize or join as necessary.
@@ -273,7 +334,9 @@ func (cmd *RunCommand) Open(config *Config, join string) *Node {
 
 		//FIXME: Need to also pass in dataURLs to bootstrap a data node
 		s = cmd.openServer(joinURLs)
+		cmd.node.DataNode = s
 		s.SetAuthenticationEnabled(cmd.config.Authentication.Enabled)
+		log.Printf("authentication enabled: %v\n", cmd.config.Authentication.Enabled)
 
 		// Enable retention policy enforcement if requested.
 		if cmd.config.Data.RetentionCheckEnabled {
@@ -295,14 +358,10 @@ func (cmd *RunCommand) Open(config *Config, join string) *Node {
 	// Start the server handler. Attach to broker if listening on the same port.
 	if s != nil {
 		h.Server = s
-
 		if config.Snapshot.Enabled {
-			if err := cmd.node.openSnapshotListener(cmd.config.SnapshotAddr()); err != nil {
-				log.Fatalf("snapshot server failed to listen on %s: %s", cmd.config.SnapshotAddr(), err)
-			}
-			log.Printf("snapshot server listening on %s", cmd.config.SnapshotAddr())
+			log.Printf("snapshot server listening on %s", cmd.config.ClusterAddr())
 		} else {
-			log.Println("snapshot server disabled")
+			log.Printf("snapshot server disabled")
 		}
 
 		if cmd.config.Admin.Enabled {
@@ -334,38 +393,39 @@ func (cmd *RunCommand) Open(config *Config, join string) *Node {
 		}
 
 		// Spin up any Graphite servers
-		for _, c := range cmd.config.Graphites {
-			if !c.Enabled {
+		for _, graphiteConfig := range cmd.config.Graphites {
+			if !graphiteConfig.Enabled {
 				continue
 			}
 
 			// Configure Graphite parsing.
 			parser := graphite.NewParser()
-			parser.Separator = c.NameSeparatorString()
-			parser.LastEnabled = c.LastEnabled()
+			parser.Separator = graphiteConfig.NameSeparatorString()
+			parser.LastEnabled = graphiteConfig.LastEnabled()
 
-			if err := s.CreateDatabaseIfNotExists(c.DatabaseString()); err != nil {
-				log.Fatalf("failed to create database for %s Graphite server: %s", c.Protocol, err.Error())
+			if err := s.CreateDatabaseIfNotExists(graphiteConfig.DatabaseString()); err != nil {
+				log.Fatalf("failed to create database for %s Graphite server: %s", graphiteConfig.Protocol, err.Error())
 			}
 
 			// Spin up the server.
 			var g graphite.Server
-			g, err := graphite.NewServer(c.Protocol, parser, s, c.DatabaseString())
+			g, err := graphite.NewServer(graphiteConfig.Protocol, parser, s, graphiteConfig.DatabaseString())
 			if err != nil {
-				log.Fatalf("failed to initialize %s Graphite server: %s", c.Protocol, err.Error())
+				log.Fatalf("failed to initialize %s Graphite server: %s", graphiteConfig.Protocol, err.Error())
 			}
 
-			err = g.ListenAndServe(c.ConnectionString(cmd.config.BindAddress))
+			err = g.ListenAndServe(graphiteConfig.ConnectionString())
 			if err != nil {
-				log.Fatalf("failed to start %s Graphite server: %s", c.Protocol, err.Error())
+				log.Fatalf("failed to start %s Graphite server: %s", graphiteConfig.Protocol, err.Error())
 			}
+			cmd.node.GraphiteServers = append(cmd.node.GraphiteServers, g)
 		}
 
 		// Spin up any OpenTSDB servers
 		if config.OpenTSDB.Enabled {
 			o := config.OpenTSDB
 			db := o.DatabaseString()
-			laddr := o.ListenAddress(config.BindAddress)
+			laddr := o.ListenAddress()
 			policy := o.RetentionPolicy
 
 			if err := s.CreateDatabaseIfNotExists(db); err != nil {
@@ -384,6 +444,7 @@ func (cmd *RunCommand) Open(config *Config, join string) *Node {
 
 			log.Println("Starting OpenTSDB service on", laddr)
 			go os.ListenAndServe(laddr)
+			cmd.node.OpenTSDBServer = os
 		}
 
 		// Start up self-monitoring if enabled.
@@ -429,6 +490,14 @@ func (cmd *RunCommand) Open(config *Config, join string) *Node {
 		}
 	}
 
+	if cmd.config.APIAddr() != cmd.config.ClusterAddr() {
+		err := cmd.node.openAPIListener(cmd.config.APIAddr(), h)
+		if err != nil {
+			log.Fatalf("API server failed to listen on %s. %s ", cmd.config.APIAddr(), err)
+		}
+	}
+	log.Printf("API server listening on %s", cmd.config.APIAddr())
+
 	return cmd.node
 }
 
@@ -455,42 +524,33 @@ func writePIDFile(path string) {
 	}
 }
 
-// parseConfig parses the configuration from a given path. Sets overrides as needed.
-func parseConfig(path, hostname string) (*Config, error) {
-	if path == "" {
-		return NewConfig(), nil
-	}
-
-	// Parse configuration.
-	config, err := ParseConfigFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("config: %s", err)
-	}
-
-	// Override config properties.
-	if hostname != "" {
-		config.Hostname = hostname
-	}
-
-	return config, nil
-}
-
 // creates and initializes a broker.
-func (cmd *RunCommand) openBroker(brokerURLs []url.URL) {
+func (cmd *RunCommand) openBroker(brokerURLs []url.URL, h *Handler) {
 	path := cmd.config.BrokerDir()
-	u := cmd.config.ClusterURL()
+	u := cmd.node.ClusterURL()
 	raftTracing := cmd.config.Logging.RaftTracing
 
 	// Create broker
 	b := influxdb.NewBroker()
+	b.TruncationInterval = time.Duration(cmd.config.Broker.TruncationInterval)
+	b.MaxTopicSize = cmd.config.Broker.MaxTopicSize
+	b.MaxSegmentSize = cmd.config.Broker.MaxSegmentSize
 	cmd.node.Broker = b
 
 	// Create raft log.
 	l := raft.NewLog()
-	l.SetURL(u)
+	l.SetURL(*u)
 	l.DebugEnabled = raftTracing
 	b.Log = l
 	cmd.node.raftLog = l
+
+	// Create Raft clock.
+	clk := raft.NewClock()
+	clk.ApplyInterval = time.Duration(cmd.config.Raft.ApplyInterval)
+	clk.ElectionTimeout = time.Duration(cmd.config.Raft.ElectionTimeout)
+	clk.HeartbeatInterval = time.Duration(cmd.config.Raft.HeartbeatInterval)
+	clk.ReconnectTimeout = time.Duration(cmd.config.Raft.ReconnectTimeout)
+	l.Clock = clk
 
 	// Open broker so it can feed last index data to the log.
 	if err := b.Open(path); err != nil {
@@ -506,9 +566,13 @@ func (cmd *RunCommand) openBroker(brokerURLs []url.URL) {
 		log.Fatalf("raft: %s", err)
 	}
 
-	index, _ := l.LastLogIndexTerm()
+	// Attach broker and log to handler.
+	h.Broker = b
+	h.Log = l
+
 	// Checks to see if the raft index is 0.  If it's 0, it might be the first
 	// node in the cluster and must initialize or join
+	index, _ := l.LastLogIndexTerm()
 	if index == 0 {
 		// If we have join URLs, then attemp to join the cluster
 		if len(brokerURLs) > 0 {
@@ -531,7 +595,9 @@ func (cmd *RunCommand) openBroker(brokerURLs []url.URL) {
 func joinLog(l *raft.Log, brokerURLs []url.URL) {
 	// Attempts to join each server until successful.
 	for _, u := range brokerURLs {
-		if err := l.Join(u); err != nil {
+		if err := l.Join(u); err == raft.ErrInitialized {
+			return
+		} else if err != nil {
 			log.Printf("join: failed to connect to raft cluster: %s: %s", (&u).String(), err)
 		} else {
 			log.Printf("join: connected raft log to %s", (&u).String())
@@ -545,7 +611,7 @@ func joinLog(l *raft.Log, brokerURLs []url.URL) {
 func (cmd *RunCommand) openServer(joinURLs []url.URL) *influxdb.Server {
 
 	// Create messaging client to the brokers.
-	c := influxdb.NewMessagingClient(cmd.config.ClusterURL())
+	c := influxdb.NewMessagingClient(*cmd.node.ClusterURL())
 	c.SetURLs(joinURLs)
 
 	if err := c.Open(filepath.Join(cmd.config.Data.Dir, messagingClientFile)); err != nil {
@@ -568,28 +634,18 @@ func (cmd *RunCommand) openServer(joinURLs []url.URL) *influxdb.Server {
 	s.ComputeNoMoreThan = time.Duration(cmd.config.ContinuousQuery.ComputeNoMoreThan)
 	s.Version = version
 	s.CommitHash = commit
-	cmd.node.DataNode = s
 
 	// Open server with data directory and broker client.
 	if err := s.Open(cmd.config.Data.Dir, c); err != nil {
 		log.Fatalf("failed to open data node: %v", err.Error())
 	}
-	log.Printf("data node opened at %s", cmd.config.Data.Dir)
+	log.Printf("data node(%d) opened at %s", s.ID(), cmd.config.Data.Dir)
 
-	dataNodeIndex := s.Index()
-	if dataNodeIndex == 0 {
-		if len(joinURLs) > 0 {
-			joinServer(s, cmd.config.ClusterURL(), joinURLs)
-			return s
-		}
+	// Give brokers time to elect a leader if entire cluster is being restarted.
+	time.Sleep(1 * time.Second)
 
-		if err := s.Initialize(cmd.config.ClusterURL()); err != nil {
-			log.Fatalf("server initialization error: %s", err)
-		}
-
-		u := cmd.config.ClusterURL()
-		log.Printf("initialized data node: %s\n", (&u).String())
-		return s
+	if s.ID() == 0 {
+		joinOrInitializeServer(s, *cmd.node.ClusterURL(), joinURLs)
 	} else {
 		log.Printf("data node already member of cluster. Using existing state and ignoring join URLs")
 	}
@@ -597,27 +653,35 @@ func (cmd *RunCommand) openServer(joinURLs []url.URL) *influxdb.Server {
 	return s
 }
 
-// joins a server to an existing cluster.
-func joinServer(s *influxdb.Server, u url.URL, joinURLs []url.URL) {
-	// TODO: Use separate broker and data join urls.
-
+// joinOrInitializeServer joins a new server to an existing cluster or initializes it as the first
+// member of the cluster
+func joinOrInitializeServer(s *influxdb.Server, u url.URL, joinURLs []url.URL) {
 	// Create data node on an existing data node.
 	for _, joinURL := range joinURLs {
-		if err := s.Join(&u, &joinURL); err != nil {
+		if err := s.Join(&u, &joinURL); err == influxdb.ErrDataNodeNotFound {
 			// No data nodes could be found to join.  We're the first.
-			if err == influxdb.ErrDataNodeNotFound {
-				if err := s.Initialize(u); err != nil {
-					log.Fatalf("server initialization error: %s", err)
-				}
-				log.Printf("initialized data node: %s\n", (&u).String())
-				return
+			if err := s.Initialize(u); err != nil {
+				log.Fatalf("server initialization error(1): %s", err)
 			}
+			log.Printf("initialized data node: %s\n", (&u).String())
+			return
+		} else if err != nil {
+			// does not return so that the next joinURL can be tried
 			log.Printf("join: failed to connect data node: %s: %s", (&u).String(), err)
 		} else {
 			log.Printf("join: connected data node to %s", u)
 			return
 		}
 	}
+
+	if len(joinURLs) == 0 {
+		if err := s.Initialize(u); err != nil {
+			log.Fatalf("server initialization error(2): %s", err)
+		}
+		log.Printf("initialized data node: %s\n", (&u).String())
+		return
+	}
+
 	log.Fatalf("join: failed to connect data node to any specified server")
 }
 

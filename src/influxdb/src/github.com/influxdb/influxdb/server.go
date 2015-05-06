@@ -391,6 +391,10 @@ func (s *Server) StartSelfMonitoring(database, retention string, interval time.D
 			// Shard-level stats.
 			tags["shardID"] = strconv.FormatUint(s.id, 10)
 			for _, sh := range s.shards {
+				if !sh.HasDataNodeID(s.id) {
+					// No stats for non-local shards.
+					continue
+				}
 				batch = append(batch, pointsFromStats(sh.stats, tags)...)
 			}
 
@@ -667,7 +671,7 @@ func (s *Server) Join(u *url.URL, joinURL *url.URL) error {
 	// Create the initial request. Might get a redirect though depending on
 	// the nodes role
 	joinURL = copyURL(joinURL)
-	joinURL.Path = "/data_nodes"
+	joinURL.Path = "/data/data_nodes"
 
 	var retries int
 	var resp *http.Response
@@ -700,6 +704,7 @@ func (s *Server) Join(u *url.URL, joinURL *url.URL) error {
 		// If we get a service unavailable, the other data nodes may still be booting
 		// so retry again
 		if resp.StatusCode == http.StatusServiceUnavailable {
+			s.Logger.Printf("join unavailable, retrying")
 			retries += 1
 			time.Sleep(1 * time.Second)
 			continue
@@ -709,6 +714,7 @@ func (s *Server) Join(u *url.URL, joinURL *url.URL) error {
 		// has given us the address of a known data node to join instead.
 		if resp.StatusCode == http.StatusTemporaryRedirect {
 			redirectURL, err := url.Parse(resp.Header.Get("Location"))
+			s.Logger.Printf("redirect join: %s", redirectURL)
 
 			// if we happen to get redirected back to ourselves then we'll never join.  This
 			// may because the heartbeater could have already fired once, registering our endpoints
@@ -745,7 +751,7 @@ func (s *Server) Join(u *url.URL, joinURL *url.URL) error {
 	assert(n.ID > 0, "invalid join node id returned: %d", n.ID)
 
 	// Download the metastore from joining server.
-	joinURL.Path = "/metastore"
+	joinURL.Path = "/data/metastore"
 	resp, err = http.Get(joinURL.String())
 	if err != nil {
 		return err
@@ -809,6 +815,39 @@ func (s *Server) CopyMetastore(w io.Writer) error {
 
 		// Write entire database to the writer.
 		return tx.Copy(w)
+	})
+}
+
+// CopyShard writes the requested shard to a writer.
+func (s *Server) CopyShard(w io.Writer, shardID uint64) error {
+	s.mu.RLock()
+
+	// Locate the shard.
+	sh, ok := s.shards[shardID]
+	if !ok {
+		s.mu.RUnlock()
+		return ErrShardNotFound
+	}
+	if sh.store == nil {
+		s.mu.RUnlock()
+		return ErrShardNotLocal
+	}
+
+	return sh.view(func(tx *shardtx) error {
+		s.mu.RUnlock() // Unlock so not held during long read.
+		sz := int(tx.Size())
+
+		// Set content length if this is a HTTP connection.
+		if w, ok := w.(http.ResponseWriter); ok {
+			w.Header().Set("Content-Length", strconv.Itoa(sz))
+		}
+
+		// Write entire shard to the writer.
+		n, err := tx.WriteTo(w)
+		if n != int64(sz) {
+			return ErrShardShortRead
+		}
+		return err
 	})
 }
 
@@ -1013,8 +1052,38 @@ func (s *Server) applyDropDatabase(m *messaging.Message) (err error) {
 	// Remove from metastore.
 	err = s.meta.mustUpdate(m.Index, func(tx *metatx) error { return tx.dropDatabase(c.Name) })
 
+	db := s.databases[c.Name]
+	for _, rp := range db.policies {
+		for _, sg := range rp.shardGroups {
+			for _, sh := range sg.Shards {
+
+				// if we have this shard locally, close and remove it
+				if sh.store != nil {
+					// close topic readers/heartbeaters/etc. connections
+					err := s.client.CloseConn(sh.ID)
+					if err != nil {
+						panic(err)
+					}
+
+					err = sh.close()
+					if err != nil {
+						panic(err)
+					}
+
+					err = os.Remove(s.shardPath(sh.ID))
+					if err != nil {
+						panic(err)
+					}
+				}
+
+				delete(s.shards, sh.ID)
+			}
+		}
+	}
+
 	// Delete the database entry.
 	delete(s.databases, c.Name)
+
 	return
 }
 
@@ -1063,7 +1132,7 @@ func (s *Server) CreateShardGroupIfNotExists(database, policy string, timestamp 
 	return err
 }
 
-func (s *Server) applyCreateShardGroupIfNotExists(m *messaging.Message) (err error) {
+func (s *Server) applyCreateShardGroupIfNotExists(m *messaging.Message) error {
 	var c createShardGroupIfNotExistsCommand
 	mustUnmarshalJSON(m.Data, &c)
 
@@ -1083,11 +1152,6 @@ func (s *Server) applyCreateShardGroupIfNotExists(m *messaging.Message) (err err
 	if g := rp.shardGroupByTimestamp(c.Timestamp); g != nil {
 		return nil
 	}
-
-	// If no shards match then create a new one.
-	g := newShardGroup()
-	g.StartTime = c.Timestamp.Truncate(rp.ShardGroupDuration).UTC()
-	g.EndTime = g.StartTime.Add(rp.ShardGroupDuration).UTC()
 
 	// Sort nodes so they're consistently assigned to the shards.
 	nodes := make([]*DataNode, 0, len(s.dataNodes))
@@ -1109,42 +1173,14 @@ func (s *Server) applyCreateShardGroupIfNotExists(m *messaging.Message) (err err
 	// replicated the correct number of times.
 	shardN := len(nodes) / replicaN
 
-	// Create a shard based on the node count and replication factor.
-	g.Shards = make([]*Shard, shardN)
-	for i := range g.Shards {
-		g.Shards[i] = newShard()
+	g := newShardGroup(c.Timestamp, rp.ShardGroupDuration)
+
+	// Create and intialize shards based on the node count and replication factor.
+	if err := g.initialize(m.Index, shardN, replicaN, db, rp, nodes, s.meta); err != nil {
+		g.close(s.id)
+		return err
 	}
-
-	// Persist to metastore if a shard was created.
-	if err = s.meta.mustUpdate(m.Index, func(tx *metatx) error {
-		// Generate an ID for the group.
-		g.ID = tx.nextShardGroupID()
-
-		// Generate an ID for each shard.
-		for _, sh := range g.Shards {
-			sh.ID = tx.nextShardID()
-		}
-
-		// Assign data nodes to shards via round robin.
-		// Start from a repeatably "random" place in the node list.
-		nodeIndex := int(m.Index % uint64(len(nodes)))
-		for _, sh := range g.Shards {
-			for i := 0; i < replicaN; i++ {
-				node := nodes[nodeIndex%len(nodes)]
-				sh.DataNodeIDs = append(sh.DataNodeIDs, node.ID)
-				nodeIndex++
-			}
-		}
-		s.stats.Add("shardsCreated", int64(len(g.Shards)))
-
-		// Retention policy has a new shard group, so update the policy.
-		rp.shardGroups = append(rp.shardGroups, g)
-
-		return tx.saveDatabase(db)
-	}); err != nil {
-		g.close()
-		return
-	}
+	s.stats.Add("shardsCreated", int64(shardN))
 
 	// Open shards assigned to this server.
 	for _, sh := range g.Shards {
@@ -1164,7 +1200,7 @@ func (s *Server) applyCreateShardGroupIfNotExists(m *messaging.Message) (err err
 		s.shards[sh.ID] = sh
 	}
 
-	return
+	return nil
 }
 
 // DeleteShardGroup deletes the shard group identified by shardID.
@@ -1198,19 +1234,11 @@ func (s *Server) applyDeleteShardGroup(m *messaging.Message) (err error) {
 		return nil
 	}
 
-	for _, shard := range g.Shards {
-		// Ignore shards not on this server.
-		if !shard.HasDataNodeID(s.id) {
-			continue
-		}
-
-		path := shard.store.Path()
-		shard.close()
-		if err := os.Remove(path); err != nil {
-			// Log, but keep going. This can happen if shards were deleted, but the server exited
-			// before it acknowledged the delete command.
-			log.Printf("error deleting shard %s, group ID %d, policy %s: %s", path, g.ID, rp.Name, err.Error())
-		}
+	// close the shard group
+	if err := g.close(s.id); err != nil {
+		// Log, but keep going. This can happen if shards were deleted, but the server exited
+		// before it acknowledged the delete command.
+		log.Printf("error deleting shard: policy %s, group ID %d, %s", rp.Name, g.ID, err)
 	}
 
 	// Remove from metastore.
@@ -1219,14 +1247,20 @@ func (s *Server) applyDeleteShardGroup(m *messaging.Message) (err error) {
 		s.stats.Add("shardsDeleted", int64(len(g.Shards)))
 		return tx.saveDatabase(db)
 	})
+
+	// remove from lookups.
+	for _, sh := range g.Shards {
+		delete(s.shards, sh.ID)
+	}
+
 	return
 }
 
 // User returns a user by username
 // Returns nil if the user does not exist.
 func (s *Server) User(name string) *User {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.users[name]
 }
 
@@ -1250,6 +1284,8 @@ func (s *Server) UserCount() int {
 
 // AdminUserExists returns whether at least 1 admin-level user exists.
 func (s *Server) AdminUserExists() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	for _, u := range s.users {
 		if u.Admin {
 			return true
@@ -1261,8 +1297,8 @@ func (s *Server) AdminUserExists() bool {
 // Authenticate returns an authenticated user by username. If any error occurs,
 // or the authentication credentials are invalid, an error is returned.
 func (s *Server) Authenticate(username, password string) (*User, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	u := s.users[username]
 
@@ -1421,8 +1457,8 @@ func (s *Server) applySetPrivilege(m *messaging.Message) error {
 // RetentionPolicy returns a retention policy by name.
 // Returns an error if the database doesn't exist.
 func (s *Server) RetentionPolicy(database, name string) (*RetentionPolicy, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	// Lookup database.
 	db := s.databases[database]
@@ -1736,10 +1772,16 @@ func (s *Server) WriteSeries(database, retentionPolicy string, points []Point) (
 			database, retentionPolicy, len(points))
 	}
 
-	// Make sure every point has at least one field.
+	// Make sure every point is valid.
 	for _, p := range points {
 		if len(p.Fields) == 0 {
 			return 0, ErrFieldsRequired
+		}
+
+		for _, f := range p.Fields {
+			if f == nil {
+				return 0, ErrFieldIsNull
+			}
 		}
 	}
 
@@ -2019,17 +2061,37 @@ func (s *Server) applyDropMeasurement(m *messaging.Message) error {
 
 // createShardGroupsIfNotExist walks the "points" and ensures that all required shards exist on the cluster.
 func (s *Server) createShardGroupsIfNotExists(database, retentionPolicy string, points []Point) error {
-	for _, p := range points {
-		// Check if shard group exists first.
-		g, err := s.shardGroupByTimestamp(database, retentionPolicy, p.Timestamp)
-		if err != nil {
-			return err
-		} else if g != nil {
-			continue
+	var commands = make([]*createShardGroupIfNotExistsCommand, 0)
+
+	err := func() error {
+		// Local function makes locking fool-proof.
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		for _, p := range points {
+			// Check if shard group exists first.
+			g, err := s.shardGroupByTimestamp(database, retentionPolicy, p.Timestamp)
+			if err != nil {
+				return err
+			} else if g != nil {
+				continue
+			}
+			commands = append(commands, &createShardGroupIfNotExistsCommand{
+				Database:  database,
+				Policy:    retentionPolicy,
+				Timestamp: p.Timestamp,
+			})
 		}
-		err = s.CreateShardGroupIfNotExists(database, retentionPolicy, p.Timestamp)
+		return nil
+	}()
+	if err != nil {
+		return err
+	}
+
+	// Create any required shard groups across the cluster. Must be done without holding the lock.
+	for _, c := range commands {
+		err = s.CreateShardGroupIfNotExists(c.Database, c.Policy, c.Timestamp)
 		if err != nil {
-			return fmt.Errorf("create shard(%s/%s): %s", retentionPolicy, p.Timestamp.Format(time.RFC3339Nano), err)
+			return fmt.Errorf("create shard(%s:%s/%s): %s", c.Database, c.Policy, c.Timestamp.Format(time.RFC3339Nano), err)
 		}
 	}
 
@@ -2202,7 +2264,7 @@ func (s *Server) ExecuteQuery(q *influxql.Query, database string, user *User, ch
 			case *influxql.CreateContinuousQueryStatement:
 				res = s.executeCreateContinuousQueryStatement(stmt, user)
 			case *influxql.DropContinuousQueryStatement:
-				continue
+				res = s.executeDropContinuousQueryStatement(stmt, user)
 			case *influxql.ShowContinuousQueriesStatement:
 				res = s.executeShowContinuousQueriesStatement(stmt, database, user)
 			default:
@@ -2219,6 +2281,8 @@ func (s *Server) ExecuteQuery(q *influxql.Query, database string, user *User, ch
 					break
 				}
 			}
+
+			s.stats.Inc("queriesExecuted")
 		}
 
 		// if there was an error send results that the remaining statements weren't executed
@@ -2226,7 +2290,6 @@ func (s *Server) ExecuteQuery(q *influxql.Query, database string, user *User, ch
 			results <- &Result{Err: ErrNotExecuted}
 		}
 
-		s.stats.Inc("queriesExecuted")
 		close(results)
 	}()
 
@@ -2463,56 +2526,65 @@ func (s *Server) executeDropMeasurementStatement(stmt *influxql.DropMeasurementS
 }
 
 func (s *Server) executeDropSeriesStatement(stmt *influxql.DropSeriesStatement, database string, user *User) *Result {
-	s.mu.RLock()
+	seriesByMeasurement, err := func() (map[string][]uint64, error) {
+		// Using a local function makes lock management foolproof.
+		s.mu.RLock()
+		defer s.mu.RUnlock()
 
-	seriesByMeasurement := make(map[string][]uint64)
-	// Handle the simple `DROP SERIES <id>` case.
-	if stmt.Source == nil && stmt.Condition == nil {
-		for _, db := range s.databases {
-			for _, m := range db.measurements {
-				if m.seriesByID[stmt.SeriesID] != nil {
-					seriesByMeasurement[m.Name] = []uint64{stmt.SeriesID}
+		seriesByMeasurement := make(map[string][]uint64)
+		// Handle the simple `DROP SERIES <id>` case.
+		if stmt.Source == nil && stmt.Condition == nil {
+			for _, db := range s.databases {
+				for _, m := range db.measurements {
+					if m.seriesByID[stmt.SeriesID] != nil {
+						seriesByMeasurement[m.Name] = []uint64{stmt.SeriesID}
+					}
 				}
 			}
+
+			return seriesByMeasurement, nil
 		}
 
-		s.mu.RUnlock()
-		return &Result{Err: s.DropSeries(database, seriesByMeasurement)}
-	}
+		// Handle the more complicated `DROP SERIES` with sources and/or conditions...
 
-	// Handle the more complicated `DROP SERIES` with sources and/or conditions...
+		// Find the database.
+		db := s.databases[database]
+		if db == nil {
+			return nil, ErrDatabaseNotFound(database)
+		}
 
-	// Find the database.
-	db := s.databases[database]
-	if db == nil {
-		s.mu.RUnlock()
-		return &Result{Err: ErrDatabaseNotFound(database)}
-	}
+		// Get the list of measurements we're interested in.
+		measurements, err := measurementsFromSourceOrDB(stmt.Source, db)
+		if err != nil {
+			return nil, err
+		}
 
-	// Get the list of measurements we're interested in.
-	measurements, err := measurementsFromSourceOrDB(stmt.Source, db)
+		for _, m := range measurements {
+			var ids seriesIDs
+			if stmt.Condition != nil {
+				// Get series IDs that match the WHERE clause.
+				filters := map[uint64]influxql.Expr{}
+				ids, _, _, err = m.walkWhereForSeriesIds(stmt.Condition, filters)
+				if err != nil {
+					return nil, err
+				}
+
+				// TODO: check return of walkWhereForSeriesIds for fields
+			} else {
+				// No WHERE clause so get all series IDs for this measurement.
+				ids = m.seriesIDs
+			}
+
+			seriesByMeasurement[m.Name] = ids
+
+		}
+
+		return seriesByMeasurement, nil
+	}()
+
 	if err != nil {
-		s.mu.RUnlock()
 		return &Result{Err: err}
 	}
-
-	for _, m := range measurements {
-		var ids seriesIDs
-		if stmt.Condition != nil {
-			// Get series IDs that match the WHERE clause.
-			filters := map[uint64]influxql.Expr{}
-			ids, _, _ = m.walkWhereForSeriesIds(stmt.Condition, filters)
-
-			// TODO: check return of walkWhereForSeriesIds for fields
-		} else {
-			// No WHERE clause so get all series IDs for this measurement.
-			ids = m.seriesIDs
-		}
-
-		seriesByMeasurement[m.Name] = ids
-	}
-	s.mu.RUnlock()
-
 	return &Result{Err: s.DropSeries(database, seriesByMeasurement)}
 }
 
@@ -2544,7 +2616,10 @@ func (s *Server) executeShowSeriesStatement(stmt *influxql.ShowSeriesStatement, 
 		if stmt.Condition != nil {
 			// Get series IDs that match the WHERE clause.
 			filters := map[uint64]influxql.Expr{}
-			ids, _, _ = m.walkWhereForSeriesIds(stmt.Condition, filters)
+			ids, _, _, err = m.walkWhereForSeriesIds(stmt.Condition, filters)
+			if err != nil {
+				return &Result{Err: err}
+			}
 
 			// If no series matched, then go to the next measurement.
 			if len(ids) == 0 {
@@ -2759,7 +2834,10 @@ func (s *Server) executeShowTagValuesStatement(stmt *influxql.ShowTagValuesState
 		if stmt.Condition != nil {
 			// Get series IDs that match the WHERE clause.
 			filters := map[uint64]influxql.Expr{}
-			ids, _, _ = m.walkWhereForSeriesIds(stmt.Condition, filters)
+			ids, _, _, err = m.walkWhereForSeriesIds(stmt.Condition, filters)
+			if err != nil {
+				return &Result{Err: err}
+			}
 
 			// If no series matched, then go to the next measurement.
 			if len(ids) == 0 {
@@ -2819,20 +2897,29 @@ func (s *Server) executeShowStatsStatement(stmt *influxql.ShowStatsStatement, us
 	// Server stats.
 	serverRow := &influxql.Row{Columns: []string{}}
 	serverRow.Name = s.stats.Name()
+	var values []interface{}
 	s.stats.Walk(func(k string, v int64) {
 		serverRow.Columns = append(serverRow.Columns, k)
-		serverRow.Values = append(serverRow.Values, []interface{}{v})
+		values = append(values, v)
 	})
+	serverRow.Values = append(serverRow.Values, values)
 	rows = append(rows, serverRow)
 
 	// Shard-level stats.
 	for _, sh := range s.shards {
+		if sh.store == nil {
+			// No stats for non-local shards
+			continue
+		}
+
 		row := &influxql.Row{Columns: []string{}}
 		row.Name = sh.stats.Name()
+		var values []interface{}
 		sh.stats.Walk(func(k string, v int64) {
 			row.Columns = append(row.Columns, k)
-			row.Values = append(row.Values, []interface{}{v})
+			values = append(values, v)
 		})
+		row.Values = append(row.Values, values)
 		rows = append(rows, row)
 	}
 
@@ -3016,6 +3103,9 @@ func (s *Server) executeDropRetentionPolicyStatement(q *influxql.DropRetentionPo
 }
 
 func (s *Server) executeShowRetentionPoliciesStatement(q *influxql.ShowRetentionPoliciesStatement, user *User) *Result {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	a, err := s.RetentionPolicies(q.Database)
 	if err != nil {
 		return &Result{Err: err}
@@ -3143,6 +3233,7 @@ func (s *Server) StartLocalMapper(rm *RemoteMapper) (*LocalMapper, error) {
 		selectFields: rm.SelectFields,
 		selectTags:   rm.SelectTags,
 		interval:     rm.Interval,
+		tmin:         rm.TMin,
 		tmax:         rm.TMax,
 		limit:        limit,
 	}
@@ -3287,9 +3378,13 @@ func (s *Server) DiagnosticsAsRows() []*influxql.Row {
 		var nodes []string
 		for _, n := range sh.DataNodeIDs {
 			nodes = append(nodes, strconv.FormatUint(n, 10))
-			shardsRow.Values = append(shardsRow.Values, []interface{}{now, strconv.FormatUint(sh.ID, 10), strings.Join(nodes, ","),
-				strconv.FormatUint(sh.index, 10), sh.store.Path()})
 		}
+		var path string
+		if sh.HasDataNodeID(s.id) {
+			path = sh.store.Path()
+		}
+		shardsRow.Values = append(shardsRow.Values, []interface{}{now, strconv.FormatUint(sh.ID, 10),
+			strings.Join(nodes, ","), strconv.FormatUint(sh.Index(), 10), path})
 	}
 
 	return []*influxql.Row{
@@ -3498,6 +3593,7 @@ type MessagingClient interface {
 
 	// Conn returns an open, streaming connection to a topic.
 	Conn(topicID uint64) MessagingConn
+	CloseConn(topicID uint64) error
 }
 
 type messagingClient struct {
@@ -3519,8 +3615,53 @@ type MessagingConn interface {
 
 // DataNode represents a data node in the cluster.
 type DataNode struct {
+	mu  sync.RWMutex
 	ID  uint64
 	URL *url.URL
+
+	// downCount is the number of times the DataNode has been marked as down
+	downCount uint
+
+	// OfflineUntil is the time when the DataNode will no longer be consider down
+	OfflineUntil time.Time
+}
+
+// Down marks the DataNode as offline for a period of time.  Each successive
+// call to Down will exponentially extend the offline time with a maximum
+// offline time of 5 minutes.
+func (d *DataNode) Down() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Clamp the timeout to 5 mins max
+	t := 2 << d.downCount
+	if t > 300 {
+		t = 300
+	}
+	d.OfflineUntil = time.Now().Add(time.Duration(t) * time.Second)
+	d.downCount += 1
+
+	log.Printf("data node %s marked offline for %ds", d.URL.String(), t)
+}
+
+// Up marks this DataNode as online if it was currently down
+func (d *DataNode) Up() {
+	d.mu.RLock()
+	if d.downCount != 0 {
+		// Upgrade to a write lock
+		d.mu.RUnlock()
+		d.mu.Lock()
+
+		// Reset state to online
+		d.downCount = 0
+		d.OfflineUntil = time.Now()
+
+		d.mu.Unlock()
+
+		log.Printf("data node %s marked online", d.URL.String())
+		return
+	}
+	d.mu.RUnlock()
 }
 
 // newDataNode returns an instance of DataNode.
@@ -3536,7 +3677,7 @@ func (p dataNodes) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
 // database can be "" for queries that do not require a database.
 // If u is nil, this means authorization is disabled.
 func (s *Server) Authorize(u *User, q *influxql.Query, database string) error {
-	const authErrLogFmt = `unauthorized request | user: %q | query: %q | database %q\n`
+	const authErrLogFmt = "unauthorized request | user: %q | query: %q | database %q\n"
 
 	if u == nil {
 		s.Logger.Printf(authErrLogFmt, "", q.String(), database)
@@ -3752,8 +3893,8 @@ func (s *Server) applyDropContinuousQueryCommand(m *messaging.Message) error {
 // RunContinuousQueries will run any continuous queries that are due to run and write the
 // results back into the database
 func (s *Server) RunContinuousQueries() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	for _, d := range s.databases {
 		for _, c := range d.continuousQueries {
@@ -3976,8 +4117,8 @@ func (s *Server) CreateSnapshotWriter() (*SnapshotWriter, error) {
 }
 
 func (s *Server) URL() url.URL {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if n := s.dataNodes[s.id]; n != nil {
 		return *n.URL
 	}

@@ -2,6 +2,7 @@ package influxdb_test
 
 import (
 	"testing"
+	"time"
 
 	"github.com/influxdb/influxdb"
 )
@@ -85,4 +86,47 @@ func TestStats_Snapshot(t *testing.T) {
 	if bar.Name() != "server" || bar.Get("a") != 100 || bar.Get("b") != 600 {
 		t.Fatalf("stats snapshot returned unexpected result: %#v", bar)
 	}
+}
+
+func TestStats_String(t *testing.T) {
+	foo := influxdb.NewStats("server")
+	foo.Set("a", 100)
+	foo.Set("b", 600)
+
+	if exp, got := `{"server":[{"a":100},{"b":600}]}`, foo.String(); exp != got {
+		t.Log("exp: ", exp)
+		t.Log("got: ", got)
+		t.Fatalf("failed to get string")
+	}
+}
+
+// TestStats_RaceCheck is meant to be run with race-detection enabled.
+func TestStats_RaceCheck(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping long-runnning Stats race checking")
+	}
+
+	foo := influxdb.NewStats("server")
+	foo.Set("a", 100)
+
+	walker := func(s string, i int64) {
+		if i == -1 {
+			return // Will never happen.
+		}
+	}
+
+	go func() {
+		for {
+			foo.Add("a", 1)
+		}
+	}()
+
+	go func() {
+		for {
+			foo.Walk(walker)
+		}
+	}()
+
+	time.Sleep(2 * time.Second)
+	t.Log("TestStats_RaceCheck completed")
 }
