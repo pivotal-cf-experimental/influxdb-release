@@ -46,7 +46,7 @@ curl -H "Content-Type: application/json" http://localhost:8086/write -d '
     "retentionPolicy": "default",
     "points": [
         {
-            "time": "2014-11-10T23:00:00Z",
+            "timestamp": "2014-11-10T23:00:00Z",
             "name": "cpu",
              "tags": {
                  "region":"uswest",

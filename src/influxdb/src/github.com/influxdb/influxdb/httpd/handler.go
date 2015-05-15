@@ -243,15 +243,21 @@ func (h *Handler) serveQuery(w http.ResponseWriter, r *http.Request, user *influ
 	for r := range results {
 		// write the status header based on the first result returned in the channel
 		if !statusWritten {
-			status := http.StatusOK
-
 			if r != nil && r.Err != nil {
 				if isAuthorizationError(r.Err) {
-					status = http.StatusUnauthorized
+					w.WriteHeader(http.StatusUnauthorized)
+				} else if isMeasurementNotFoundError(r.Err) {
+					w.WriteHeader(http.StatusOK)
+				} else if isTagNotFoundError(r.Err) {
+					w.WriteHeader(http.StatusOK)
+				} else if isFieldNotFoundError(r.Err) {
+					w.WriteHeader(http.StatusOK)
+				} else {
+					w.WriteHeader(http.StatusInternalServerError)
 				}
+			} else {
+				w.WriteHeader(http.StatusOK)
 			}
-
-			w.WriteHeader(status)
 			statusWritten = true
 		}
 
@@ -331,10 +337,10 @@ func interfaceToString(v interface{}) string {
 }
 
 type Point struct {
-	Name   string                 `json:"name"`
-	Time   time.Time              `json:"time"`
-	Tags   map[string]string      `json:"tags"`
-	Fields map[string]interface{} `json:"fields"`
+	Name      string                 `json:"name"`
+	Timestamp time.Time              `json:"timestamp"`
+	Tags      map[string]string      `json:"tags"`
+	Fields    map[string]interface{} `json:"fields"`
 }
 
 type Batch struct {
@@ -420,7 +426,7 @@ func (h *Handler) serveDump(w http.ResponseWriter, r *http.Request, user *influx
 				for _, tuple := range row.Values {
 					for subscript, cell := range tuple {
 						if row.Columns[subscript] == "time" {
-							point.Time, _ = cell.(time.Time)
+							point.Timestamp, _ = cell.(time.Time)
 							continue
 						}
 						point.Fields[row.Columns[subscript]] = cell
@@ -495,12 +501,12 @@ func (h *Handler) serveWrite(w http.ResponseWriter, r *http.Request, user *influ
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		writeError(influxdb.Result{Err: err}, http.StatusBadRequest)
+		writeError(influxdb.Result{Err: err}, http.StatusInternalServerError)
 		return
 	}
 
 	if bp.Database == "" {
-		writeError(influxdb.Result{Err: fmt.Errorf("database is required")}, http.StatusBadRequest)
+		writeError(influxdb.Result{Err: fmt.Errorf("database is required")}, http.StatusInternalServerError)
 		return
 	}
 
@@ -526,14 +532,10 @@ func (h *Handler) serveWrite(w http.ResponseWriter, r *http.Request, user *influ
 	}
 
 	if index, err := h.server.WriteSeries(bp.Database, bp.RetentionPolicy, points); err != nil {
-		if influxdb.IsClientError(err) {
-			writeError(influxdb.Result{Err: err}, http.StatusBadRequest)
-		} else {
-			writeError(influxdb.Result{Err: err}, http.StatusInternalServerError)
-		}
+		writeError(influxdb.Result{Err: err}, http.StatusInternalServerError)
 		return
 	} else {
-		w.WriteHeader(http.StatusNoContent)
+		w.WriteHeader(http.StatusOK)
 		w.Header().Add("X-InfluxDB-Index", fmt.Sprintf("%d", index))
 	}
 }
@@ -835,6 +837,19 @@ type dataNodeJSON struct {
 func isAuthorizationError(err error) bool {
 	_, ok := err.(influxdb.ErrAuthorize)
 	return ok
+}
+
+func isMeasurementNotFoundError(err error) bool {
+	s := err.Error()
+	return strings.HasPrefix(s, "measurement") && strings.HasSuffix(s, "not found") || strings.Contains(s, "measurement not found")
+}
+
+func isTagNotFoundError(err error) bool {
+	return (strings.HasPrefix(err.Error(), "unknown field or tag name"))
+}
+
+func isFieldNotFoundError(err error) bool {
+	return (strings.HasPrefix(err.Error(), "field not found"))
 }
 
 // mapError writes an error result after trying to start a mapper

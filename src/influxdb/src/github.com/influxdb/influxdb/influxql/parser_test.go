@@ -75,7 +75,7 @@ func TestParser_ParseStatement(t *testing.T) {
 
 		// SELECT statement
 		{
-			s: fmt.Sprintf(`SELECT mean(field1), sum(field2) ,count(field3) AS field_x FROM myseries WHERE host = 'hosta.influxdb.org' and time > '%s' GROUP BY time(10h) ORDER BY ASC LIMIT 20 OFFSET 10;`, now.UTC().Format(time.RFC3339Nano)),
+			s: `SELECT mean(field1), sum(field2) ,count(field3) AS field_x FROM myseries WHERE host = 'hosta.influxdb.org' GROUP BY time(10h) ORDER BY ASC LIMIT 20 OFFSET 10;`,
 			stmt: &influxql.SelectStatement{
 				IsRawQuery: false,
 				Fields: []*influxql.Field{
@@ -85,17 +85,9 @@ func TestParser_ParseStatement(t *testing.T) {
 				},
 				Sources: []influxql.Source{&influxql.Measurement{Name: "myseries"}},
 				Condition: &influxql.BinaryExpr{
-					Op: influxql.AND,
-					LHS: &influxql.BinaryExpr{
-						Op:  influxql.EQ,
-						LHS: &influxql.VarRef{Val: "host"},
-						RHS: &influxql.StringLiteral{Val: "hosta.influxdb.org"},
-					},
-					RHS: &influxql.BinaryExpr{
-						Op:  influxql.GT,
-						LHS: &influxql.VarRef{Val: "time"},
-						RHS: &influxql.TimeLiteral{Val: now.UTC()},
-					},
+					Op:  influxql.EQ,
+					LHS: &influxql.VarRef{Val: "host"},
+					RHS: &influxql.StringLiteral{Val: "hosta.influxdb.org"},
 				},
 				Dimensions: []*influxql.Dimension{{Expr: &influxql.Call{Name: "time", Args: []influxql.Expr{&influxql.DurationLiteral{Val: 10 * time.Hour}}}}},
 				SortFields: []*influxql.SortField{
@@ -103,18 +95,6 @@ func TestParser_ParseStatement(t *testing.T) {
 				},
 				Limit:  20,
 				Offset: 10,
-			},
-		},
-
-		// SELECT statement
-		{
-			s: `SELECT derivative(field1, 1h) FROM myseries;`,
-			stmt: &influxql.SelectStatement{
-				IsRawQuery: false,
-				Fields: []*influxql.Field{
-					{Expr: &influxql.Call{Name: "derivative", Args: []influxql.Expr{&influxql.VarRef{Val: "field1"}, &influxql.DurationLiteral{Val: time.Hour}}}},
-				},
-				Sources: []influxql.Source{&influxql.Measurement{Name: "myseries"}},
 			},
 		},
 
@@ -324,18 +304,13 @@ func TestParser_ParseStatement(t *testing.T) {
 
 		// SELECT statement with fill
 		{
-			s: fmt.Sprintf(`SELECT mean(value) FROM cpu where time < '%s' GROUP BY time(5m) fill(1)`, now.UTC().Format(time.RFC3339Nano)),
+			s: `SELECT mean(value) FROM cpu GROUP BY time(5m) fill(1)`,
 			stmt: &influxql.SelectStatement{
 				Fields: []*influxql.Field{{
 					Expr: &influxql.Call{
 						Name: "mean",
 						Args: []influxql.Expr{&influxql.VarRef{Val: "value"}}}}},
-				Sources: []influxql.Source{&influxql.Measurement{Name: "cpu"}},
-				Condition: &influxql.BinaryExpr{
-					Op:  influxql.LT,
-					LHS: &influxql.VarRef{Val: "time"},
-					RHS: &influxql.TimeLiteral{Val: now.UTC()},
-				},
+				Sources:    []influxql.Source{&influxql.Measurement{Name: "cpu"}},
 				Dimensions: []*influxql.Dimension{{Expr: &influxql.Call{Name: "time", Args: []influxql.Expr{&influxql.DurationLiteral{Val: 5 * time.Minute}}}}},
 				Fill:       influxql.NumberFill,
 				FillValue:  float64(1),
@@ -344,18 +319,13 @@ func TestParser_ParseStatement(t *testing.T) {
 
 		// SELECT statement with FILL(none) -- check case insensitivity
 		{
-			s: fmt.Sprintf(`SELECT mean(value) FROM cpu where time < '%s' GROUP BY time(5m) FILL(none)`, now.UTC().Format(time.RFC3339Nano)),
+			s: `SELECT mean(value) FROM cpu GROUP BY time(5m) FILL(none)`,
 			stmt: &influxql.SelectStatement{
 				Fields: []*influxql.Field{{
 					Expr: &influxql.Call{
 						Name: "mean",
 						Args: []influxql.Expr{&influxql.VarRef{Val: "value"}}}}},
-				Sources: []influxql.Source{&influxql.Measurement{Name: "cpu"}},
-				Condition: &influxql.BinaryExpr{
-					Op:  influxql.LT,
-					LHS: &influxql.VarRef{Val: "time"},
-					RHS: &influxql.TimeLiteral{Val: now.UTC()},
-				},
+				Sources:    []influxql.Source{&influxql.Measurement{Name: "cpu"}},
 				Dimensions: []*influxql.Dimension{{Expr: &influxql.Call{Name: "time", Args: []influxql.Expr{&influxql.DurationLiteral{Val: 5 * time.Minute}}}}},
 				Fill:       influxql.NoFill,
 			},
@@ -363,18 +333,13 @@ func TestParser_ParseStatement(t *testing.T) {
 
 		// SELECT statement with previous fill
 		{
-			s: fmt.Sprintf(`SELECT mean(value) FROM cpu where time < '%s' GROUP BY time(5m) FILL(previous)`, now.UTC().Format(time.RFC3339Nano)),
+			s: `SELECT mean(value) FROM cpu GROUP BY time(5m) fill(previous)`,
 			stmt: &influxql.SelectStatement{
 				Fields: []*influxql.Field{{
 					Expr: &influxql.Call{
 						Name: "mean",
 						Args: []influxql.Expr{&influxql.VarRef{Val: "value"}}}}},
-				Sources: []influxql.Source{&influxql.Measurement{Name: "cpu"}},
-				Condition: &influxql.BinaryExpr{
-					Op:  influxql.LT,
-					LHS: &influxql.VarRef{Val: "time"},
-					RHS: &influxql.TimeLiteral{Val: now.UTC()},
-				},
+				Sources:    []influxql.Source{&influxql.Measurement{Name: "cpu"}},
 				Dimensions: []*influxql.Dimension{{Expr: &influxql.Call{Name: "time", Args: []influxql.Expr{&influxql.DurationLiteral{Val: 5 * time.Minute}}}}},
 				Fill:       influxql.PreviousFill,
 			},
@@ -1008,12 +973,9 @@ func TestParser_ParseStatement(t *testing.T) {
 		{s: `SELECT field1 FROM myseries ORDER BY 1`, err: `found 1, expected identifier, ASC, or DESC at line 1, char 38`},
 		{s: `SELECT field1 AS`, err: `found EOF, expected identifier at line 1, char 18`},
 		{s: `SELECT field1 FROM foo group by time(1s)`, err: `GROUP BY requires at least one aggregate function`},
-		{s: `SELECT count(value) FROM foo group by time(1s)`, err: `aggregate functions with GROUP BY time require a WHERE time clause`},
-		{s: `SELECT count(value) FROM foo group by time(1s) where host = 'hosta.influxdb.org'`, err: `aggregate functions with GROUP BY time require a WHERE time clause`},
 		{s: `SELECT field1 FROM 12`, err: `found 12, expected identifier at line 1, char 20`},
 		{s: `SELECT 1000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 FROM myseries`, err: `unable to parse number at line 1, char 8`},
 		{s: `SELECT 10.5h FROM myseries`, err: `found h, expected FROM at line 1, char 12`},
-		{s: `SELECT derivative(field1), field1 FROM myseries`, err: `derivative cannot be used with other fields`},
 		{s: `DELETE`, err: `found EOF, expected FROM at line 1, char 8`},
 		{s: `DELETE FROM`, err: `found EOF, expected identifier at line 1, char 13`},
 		{s: `DELETE FROM myseries WHERE`, err: `found EOF, expected identifier, string, number, bool at line 1, char 28`},

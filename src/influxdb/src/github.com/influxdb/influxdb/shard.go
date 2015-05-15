@@ -382,9 +382,6 @@ func (s *Shard) processor(conn MessagingConn, closing <-chan struct{}) {
 		s.mu.Lock()
 		s.index = m.Index
 		s.mu.Unlock()
-
-		// Update the connection with the high index.
-		conn.SetIndex(m.Index)
 	}
 }
 

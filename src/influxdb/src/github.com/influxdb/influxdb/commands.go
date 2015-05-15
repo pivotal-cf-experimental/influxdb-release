@@ -66,9 +66,9 @@ type dropDatabaseCommand struct {
 }
 
 type createShardGroupIfNotExistsCommand struct {
-	Database string    `json:"database"`
-	Policy   string    `json:"policy"`
-	Time     time.Time `json:"time"`
+	Database  string    `json:"database"`
+	Policy    string    `json:"policy"`
+	Timestamp time.Time `json:"timestamp"`
 }
 
 type deleteShardGroupCommand struct {
