@@ -1,8 +1,8 @@
 ---
 name: influxdb
 templates:
-  influxd_ctl.erb: bin/influxd_ctl
-  influxdb.conf.erb: config/influxdb.conf
+  influxdb_ctl.erb: bin/influxdb_ctl
+  influxdb_config.toml.erb: config/influxdb_config.toml
 
 packages:
 - influxdb

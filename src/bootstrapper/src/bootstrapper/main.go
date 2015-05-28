@@ -6,8 +6,10 @@ import (
 	"net/url"
 	"os"
 
-	"github.com/influxdb/influxdb/client"
+	"gopkg.in/pivotal-cf-experimental/influxdb.v0/client"
 )
+
+const mainShardSpace = "default"
 
 func main() {
 	influxUrl := flag.String("influxUrl", "http://localhost:8086", "influx endpoint")
@@ -15,7 +17,7 @@ func main() {
 	influxPassword := flag.String("password", "root", "influx user's password")
 	databaseName := flag.String("database", "", "Database name to create")
 	retention := flag.String("retention", "14d", "Retention duration")
-	replication := flag.String("replication", "1", "Replication count")
+	replication := flag.Uint("replication", 1, "Replication count")
 	flag.Parse()
 
 	if len(*databaseName) == 0 {
@@ -25,25 +27,54 @@ func main() {
 	}
 
 	influxServerUrl, _ := url.Parse(*influxUrl)
-	influxConfig := client.Config{
-		URL:       *influxServerUrl,
-		Username:  *influxUser,
-		Password:  *influxPassword,
-		UserAgent: "influx-bootstrap",
+	influxConfig := &client.ClientConfig{
+		Host:     influxServerUrl.Host,
+		IsSecure: influxServerUrl.Scheme == "https",
+		Username: *influxUser,
+		Password: *influxPassword,
+		Database: *databaseName,
 	}
 	dbClient, err := client.NewClient(influxConfig)
 	if err != nil {
-		panic(fmt.Sprintf("Error connecting to Influx DB: %s", err))
+		panic(fmt.Errorf("Error connecting to Influx DB: %v", err))
 	}
 
-	_, err = dbClient.Query(client.Query{Command: fmt.Sprintf("create database %s", *databaseName)})
-	if err != nil {
-		panic(fmt.Sprintf("Error creating DB '%s': %s", *databaseName, err))
+	existsErr := fmt.Sprintf("Server returned (409): database %s exists", *databaseName)
+	err = dbClient.CreateDatabase(*databaseName)
+	if err != nil && err.Error() != existsErr {
+		panic(fmt.Errorf("Error creating DB '%s': %v", *databaseName, err))
 	}
 
-	retentionCommand := fmt.Sprintf("create RETENTION POLICY \"default\" ON %s DURATION %s REPLICATION %s DEFAULT", *databaseName, *retention, *replication)
-	_, err = dbClient.Query(client.Query{Command: retentionCommand})
+	shardSpaces, err := dbClient.GetShardSpaces()
 	if err != nil {
-		panic(fmt.Sprintf("Error creating default retention policy: %s", err))
+		panic(fmt.Errorf("Error loading shard spaces: %v", err))
+	}
+	var defaultSpace *client.ShardSpace
+	for _, space := range shardSpaces {
+		if space.Name == mainShardSpace {
+			defaultSpace = space
+			break
+		}
+	}
+
+	if defaultSpace == nil {
+		defaultSpace := &client.ShardSpace{
+			Name:              mainShardSpace,
+			RetentionPolicy:   *retention,
+			Regex:             "/.*/",
+			ReplicationFactor: uint32(*replication),
+		}
+		err = dbClient.CreateShardSpace(*databaseName, defaultSpace)
+		if err != nil {
+			panic(fmt.Errorf("Error creating default retention policy: %v", err))
+		}
+		return
+	}
+
+	defaultSpace.RetentionPolicy = *retention
+	defaultSpace.ReplicationFactor = uint32(*replication)
+	err = dbClient.UpdateShardSpace(*databaseName, defaultSpace.Name, defaultSpace)
+	if err != nil {
+		panic(fmt.Errorf("Error updating default retention policy: %v", err))
 	}
 }

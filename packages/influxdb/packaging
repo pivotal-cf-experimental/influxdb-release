@@ -2,10 +2,5 @@
 set -e
 
 cd influxdb
-
-export GOROOT=$(readlink -nf /var/vcap/packages/go)
-export GOPATH=$PWD
-export GOBIN=${BOSH_INSTALL_TARGET}
-export PATH=$PATH:$GOROOT/bin
-
-go install github.com/influxdb/...
+tar xzf influxdb*.tar.gz
+cp -R build/* ${BOSH_INSTALL_TARGET}
