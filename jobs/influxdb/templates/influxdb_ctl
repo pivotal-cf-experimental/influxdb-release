@@ -1,0 +1,36 @@
+#!/bin/bash
+
+RUN_DIR=/var/vcap/sys/run/influxdb
+LOG_DIR=/var/vcap/sys/log/influxdb
+PIDFILE=${RUN_DIR}/influxdb.pid
+JOB_DIR=/var/vcap/jobs/influxdb
+CONFIG_FILE=${JOB_DIR}/config/influxdb_config.toml
+
+PACKAGE_DIR=/var/vcap/packages/influxdb
+
+case $1 in
+
+start)
+mkdir -p $RUN_DIR $LOG_DIR
+chown -R vcap:vcap $RUN_DIR $LOG_DIR
+
+cd $PACKAGE_DIR
+
+ulimit -n 8192
+
+exec chpst -u vcap:vcap ./influxd -config ${CONFIG_FILE} -pidfile ${PIDFILE} &>> ${LOG_DIR}/influxdb.log
+
+;;
+
+stop)
+
+kill `cat $PIDFILE`
+
+rm -f $PIDFILE
+
+;;
+
+*)
+echo "Usage: ctl {start|stop}" ;;
+
+esac

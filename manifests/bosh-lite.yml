@@ -1,5 +1,5 @@
 name: influxdb-bosh-lite
-director_uuid: a79a6def-5df4-47e4-9a5b-50d772d69e22
+director_uuid: 56a8b33a-ed1a-4918-822f-a4266e659af1
 releases:
 - {name: influxdb, version: latest}
 compilation:
@@ -12,17 +12,17 @@ jobs:
 - name: influxdb
   templates:
   - {name: influxdb, release: influxdb}
-  instances: 3
+  instances: 1
   resource_pool: default
   persistent_disk: 10024
   networks:
   - name: warden-net
-    static_ips:  [10.244.7.6, 10.244.7.10, 10.244.7.14]
+    static_ips:  [10.244.7.6]
 
 properties:
   influxdb:
     database: test
-    ips: [10.244.7.6, 10.244.7.10, 10.244.7.14]
+    ips: [10.244.7.6]
 
 networks:
 - name: warden-net
