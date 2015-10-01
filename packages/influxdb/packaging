@@ -1,6 +1,12 @@
 # abort script on any command that exits with a non zero value
 set -e
 
-cd influxdb
-tar xzf influxdb*.tar.gz
-cp -R build/* ${BOSH_INSTALL_TARGET}
+ln -s . src
+
+export GOROOT=$(readlink -nf /var/vcap/packages/go)
+export GOPATH=$PWD
+export GOBIN=${BOSH_INSTALL_TARGET}
+export PATH=$PATH:$GOROOT/bin
+
+go install github.com/influxdb/influxdb/cmd/influx
+go install github.com/influxdb/influxdb/cmd/influxd

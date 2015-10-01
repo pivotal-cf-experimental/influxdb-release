@@ -5,4 +5,7 @@ dependencies:
 - go
 
 files:
-- influxdb/**/*
+- github.com/**/*
+- collectd.org/**/*
+- golang.org/**/*
+- gopkg.in/**/*

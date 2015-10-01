@@ -1,0 +1,123 @@
+[submodule "src/github.com/influxdb/influxdb"]
+	path = src/github.com/influxdb/influxdb
+	url = git@github.com:influxdb/influxdb
+[submodule "src/collectd.org"]
+	path = src/collectd.org
+	url = git@github.com:collectd/go-collectd
+[submodule "src/github.com/BurntSushi/toml"]
+	path = src/github.com/BurntSushi/toml
+	url = git@github.com:BurntSushi/toml
+[submodule "src/github.com/armon/go-metrics"]
+	path = src/github.com/armon/go-metrics
+	url = git@github.com:armon/go-metrics
+[submodule "src/github.com/bmizerany/pat"]
+	path = src/github.com/bmizerany/pat
+	url = git@github.com:bmizerany/pat
+[submodule "src/github.com/boltdb/bolt"]
+	path = src/github.com/boltdb/bolt
+	url = git@github.com:boltdb/bolt
+[submodule "src/github.com/gogo/protobuf"]
+	path = src/github.com/gogo/protobuf
+	url = git@github.com:gogo/protobuf
+[submodule "src/github.com/golang/snappy"]
+	path = src/github.com/golang/snappy
+	url = git@github.com:golang/snappy
+[submodule "src/github.com/hashicorp/go-msgpack"]
+	path = src/github.com/hashicorp/go-msgpack
+	url = git@github.com:hashicorp/go-msgpack
+[submodule "src/github.com/hashicorp/raft"]
+	path = src/github.com/hashicorp/raft
+	url = git@github.com:hashicorp/raft
+[submodule "src/github.com/hashicorp/raft-boltdb"]
+	path = src/github.com/hashicorp/raft-boltdb
+	url = git@github.com:hashicorp/raft-boltdb
+[submodule "src/github.com/kimor79/gollectd"]
+	path = src/github.com/kimor79/gollectd
+	url = git@github.com:kimor79/gollectd
+[submodule "src/github.com/peterh/liner"]
+	path = src/github.com/peterh/liner
+	url = git@github.com:peterh/liner
+[submodule "src/golang.org/x/crypto"]
+	path = src/golang.org/x/crypto
+	url = https://go.googlesource.com/crypto
+[submodule "src/gopkg.in/fatih/pool.v2"]
+	path = src/gopkg.in/fatih/pool.v2
+	url = https://gopkg.in/fatih/pool.v2
+[submodule "src/github.com/rakyll/statik"]
+	path = src/github.com/rakyll/statik
+	url = git@github.com:rakyll/statik
+[submodule "src/github.com/DataDog/datadog-go"]
+	path = src/github.com/DataDog/datadog-go
+	url = git@github.com:DataDog/datadog-go
+[submodule "src/github.com/Sirupsen/logrus"]
+	path = src/github.com/Sirupsen/logrus
+	url = git@github.com:Sirupsen/logrus
+[submodule "src/github.com/beorn7/perks"]
+	path = src/github.com/beorn7/perks
+	url = git@github.com:beorn7/perks
+[submodule "src/github.com/golang/protobuf"]
+	path = src/github.com/golang/protobuf
+	url = git@github.com:golang/protobuf
+[submodule "src/github.com/julienschmidt/httprouter"]
+	path = src/github.com/julienschmidt/httprouter
+	url = git@github.com:julienschmidt/httprouter
+[submodule "src/github.com/matttproud/golang_protobuf_extensions"]
+	path = src/github.com/matttproud/golang_protobuf_extensions
+	url = git@github.com:matttproud/golang_protobuf_extensions
+[submodule "src/github.com/prometheus/client_golang"]
+	path = src/github.com/prometheus/client_golang
+	url = git@github.com:prometheus/client_golang
+[submodule "src/github.com/prometheus/client_model"]
+	path = src/github.com/prometheus/client_model
+	url = git@github.com:prometheus/client_model
+[submodule "src/github.com/prometheus/common"]
+	path = src/github.com/prometheus/common
+	url = git@github.com:prometheus/common
+[submodule "src/github.com/prometheus/procfs"]
+	path = src/github.com/prometheus/procfs
+	url = git@github.com:prometheus/procfs
+[submodule "src/golang.org/x/net"]
+	path = src/golang.org/x/net
+	url = https://go.googlesource.com/net
+[submodule "src/github.com/agtorre/gocolorize"]
+	path = src/github.com/agtorre/gocolorize
+	url = git@github.com:agtorre/gocolorize
+[submodule "src/github.com/bradfitz/gomemcache"]
+	path = src/github.com/bradfitz/gomemcache
+	url = git@github.com:bradfitz/gomemcache
+[submodule "src/github.com/garyburd/redigo"]
+	path = src/github.com/garyburd/redigo
+	url = git@github.com:garyburd/redigo
+[submodule "src/github.com/bugsnag/bugsnag-go"]
+	path = src/github.com/bugsnag/bugsnag-go
+	url = git@github.com:bugsnag/bugsnag-go
+[submodule "src/github.com/bugsnag/osext"]
+	path = src/github.com/bugsnag/osext
+	url = git@github.com:bugsnag/osext
+[submodule "src/github.com/bugsnag/panicwrap"]
+	path = src/github.com/bugsnag/panicwrap
+	url = git@github.com:bugsnag/panicwrap
+[submodule "src/github.com/getsentry/raven-go"]
+	path = src/github.com/getsentry/raven-go
+	url = git@github.com:getsentry/raven-go
+[submodule "src/github.com/revel/revel"]
+	path = src/github.com/revel/revel
+	url = git@github.com:revel/revel
+[submodule "src/github.com/robfig/config"]
+	path = src/github.com/robfig/config
+	url = git@github.com:robfig/config
+[submodule "src/github.com/robfig/go-cache"]
+	path = src/github.com/robfig/go-cache
+	url = git@github.com:robfig/go-cache
+[submodule "src/github.com/robfig/pathtree"]
+	path = src/github.com/robfig/pathtree
+	url = git@github.com:robfig/pathtree
+[submodule "src/github.com/tobi/airbrake-go"]
+	path = src/github.com/tobi/airbrake-go
+	url = git@github.com:tobi/airbrake-go
+[submodule "src/golang.org/x/text"]
+	path = src/golang.org/x/text
+	url = https://go.googlesource.com/text
+[submodule "src/gopkg.in/fsnotify.v1"]
+	path = src/gopkg.in/fsnotify.v1
+	url = https://gopkg.in/fsnotify.v1

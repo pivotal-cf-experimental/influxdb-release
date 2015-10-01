@@ -1,5 +1,5 @@
 check process influxdb
-  with pidfile /var/vcap/store/influxdb/influxdb.pid
+  with pidfile /var/vcap/sys/run/influxdb/influxdb.pid
   start program "/var/vcap/jobs/influxdb/bin/influxdb_ctl start"
-  stop program "/var/vcap/jobs/influxdb/bin/influxdb_ctl stop"
+  stop program "/var/vcap/jobs/influxdb/bin/influxdb_ctl stop" with timeout 120 seconds
   group vcap

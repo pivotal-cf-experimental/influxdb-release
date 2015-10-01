@@ -1,12 +1,11 @@
 ---
 name: influxdb
 templates:
-  influxdb_ctl.erb: bin/influxdb_ctl
+  influxdb_ctl: bin/influxdb_ctl
   influxdb_config.toml.erb: config/influxdb_config.toml
 
 packages:
 - influxdb
-- bootstrapper
 
 properties:
   influxdb.ips:
