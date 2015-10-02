@@ -1,6 +1,7 @@
 ---
 name: influxdb
 templates:
+  influxdb_start.sh.erb: bin/influxdb_start.sh
   influxdb_ctl: bin/influxdb_ctl
   influxdb_config.toml.erb: config/influxdb_config.toml
 
@@ -12,15 +13,9 @@ properties:
     description: "an array of the ips for influxdb"
   influxdb.database:
     description: "database name in influxdb to create"
-  influxdb.user:
-    default: "root"
-    description: "influx user"
-  influxdb.password:
-    default: "root"
-    description: "influx user's password"
   influxdb.retention:
-    default: "14d"
+    default: "1d"
     description: "default retention period for database"
   influxdb.replication:
-    default: "3"
+    default: "1"
     description: "default replication count for database"

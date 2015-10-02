@@ -8,8 +8,6 @@ CONFIG_FILE=${JOB_DIR}/config/influxdb_config.toml
 
 STORE_DIR=/var/vcap/store/influxdb
 
-PACKAGE_DIR=/var/vcap/packages/influxdb
-
 wait_pidfile() {
   pidfile=$1
   try_kill=$2
@@ -97,11 +95,7 @@ pid_guard $PIDFILE "InfluxDB"
 mkdir -p $RUN_DIR $LOG_DIR $STORE_DIR
 chown -R vcap:vcap $RUN_DIR $LOG_DIR $STORE_DIR
 
-cd $PACKAGE_DIR
-
-ulimit -n 8192
-
-exec chpst -u vcap:vcap ./influxd -config ${CONFIG_FILE} -pidfile ${PIDFILE} >> ${LOG_DIR}/influxdb.log 2>&1
+exec $JOB_DIR/bin/influxdb_start.sh $CONFIG_FILE $PIDFILE $LOG_DIR >> $LOG_DIR/influxdb_start.log 2>&1
 
 ;;
 

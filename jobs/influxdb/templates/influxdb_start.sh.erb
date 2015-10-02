@@ -1,0 +1,37 @@
+#!/bin/bash
+#-e
+
+echo "Setting up InfluxDB using $*"
+
+CONFIG_FILE=$1
+PID_FILE=$2
+LOG_DIR=$3
+
+PACKAGE_DIR=/var/vcap/packages/influxdb
+
+DATABASE_NAME="<%= p("influxdb.database") %>"
+RETENTION="<%= p("influxdb.retention") %>"
+REPLICATION="<%= p("influxdb.replication") %>"
+
+cd $PACKAGE_DIR
+
+ulimit -n 8192
+
+RUN_AS_VCAP="chpst -u vcap:vcap"
+
+echo "Starting the influx daemon"
+$RUN_AS_VCAP ./influxd -config $CONFIG_FILE -pidfile $PID_FILE >> $LOG_DIR/influxdb.log 2>&1 &
+
+echo "Waiting for influxd to start"
+sleep 5
+
+DB_EXISTS=$($RUN_AS_VCAP ./influx -execute "SHOW DATABASES" | grep $DATABASE_NAME | wc -l)
+
+if [ $DB_EXISTS -eq 0 ]; then
+    echo "Creating database $DATABASE_NAME"
+    $RUN_AS_VCAP ./influx -execute "CREATE DATABASE $DATABASE_NAME"
+    echo "Setting the retention policy to duration: $RETENTION replication: $REPLICATION"
+    $RUN_AS_VCAP ./influx -execute "CREATE RETENTION POLICY ${DATABASE_NAME}_policy ON $DATABASE_NAME DURATION $RETENTION REPLICATION $REPLICATION"
+else
+    echo "Database $DATABASE_NAME already exists skipping creation..."
+fi
