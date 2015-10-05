@@ -30,6 +30,14 @@ reporting-disabled = false
   wal-flush-cold-interval = "5s"
   wal-partition-size-threshold = 20971520
 
+[[udp]]
+  enabled = true
+  bind-address = ":8089" # the bind address
+  database = "<%= p('influxdb.database') %>" # Name of the database that will be written to
+#  batch-size = 1000 # will flush if this many points get buffered
+#  batch-timeout = "1s" # will flush at least this often even if the batch-size is not reached
+#  batch-pending = 5 # number of batches that may be pending in memory
+
 [cluster]
   force-remote-mapping = false
   write-timeout = "5s"
