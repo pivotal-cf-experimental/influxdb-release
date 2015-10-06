@@ -12,6 +12,8 @@ PACKAGE_DIR=/var/vcap/packages/influxdb
 DATABASE_NAME="<%= p("influxdb.database") %>"
 RETENTION="<%= p("influxdb.retention") %>"
 REPLICATION="<%= p("influxdb.replication") %>"
+USER="<%= p("influxdb.user") %>"
+PASSWORD="<%= p("influxdb.password") %>"
 
 cd $PACKAGE_DIR
 
@@ -32,6 +34,10 @@ if [ $DB_EXISTS -eq 0 ]; then
     $RUN_AS_VCAP ./influx -execute "CREATE DATABASE $DATABASE_NAME"
     echo "Setting the retention policy to duration: $RETENTION replication: $REPLICATION"
     $RUN_AS_VCAP ./influx -execute "CREATE RETENTION POLICY ${DATABASE_NAME}_policy ON $DATABASE_NAME DURATION $RETENTION REPLICATION $REPLICATION"
+    echo "Adding user: $USER"
+    $RUN_AS_VCAP ./influx -execute "CREATE USER $USER WITH PASSWORD '$PASSWORD'"
+    echo "Granting access to user: $USER"
+    $RUN_AS_VCAP ./influx -execute "GRANT ALL ON $DATABASE_NAME TO $USER"
 else
     echo "Database $DATABASE_NAME already exists skipping creation..."
 fi

@@ -19,3 +19,7 @@ properties:
   influxdb.replication:
     default: "1"
     description: "default replication count for database"
+  influxdb.user:
+    description: "database user"
+  influxdb.password:
+    description: "password for the database user"

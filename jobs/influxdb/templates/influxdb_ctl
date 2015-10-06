@@ -6,7 +6,7 @@ PIDFILE=${RUN_DIR}/influxdb.pid
 JOB_DIR=/var/vcap/jobs/influxdb
 CONFIG_FILE=${JOB_DIR}/config/influxdb_config.toml
 
-STORE_DIR=/var/vcap/store/influxdb
+DATA_DIR=/var/vcap/data/influxdb
 
 wait_pidfile() {
   pidfile=$1
@@ -92,8 +92,8 @@ start)
 
 pid_guard $PIDFILE "InfluxDB"
 
-mkdir -p $RUN_DIR $LOG_DIR $STORE_DIR
-chown -R vcap:vcap $RUN_DIR $LOG_DIR $STORE_DIR
+mkdir -p $RUN_DIR $LOG_DIR $DATA_DIR
+chown -R vcap:vcap $RUN_DIR $LOG_DIR $DATA_DIR
 
 exec $JOB_DIR/bin/influxdb_start.sh $CONFIG_FILE $PIDFILE $LOG_DIR >> $LOG_DIR/influxdb_start.log 2>&1
 
