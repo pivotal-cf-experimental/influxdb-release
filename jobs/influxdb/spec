@@ -9,8 +9,8 @@ packages:
 - influxdb
 
 properties:
-  influxdb.ips:
-    description: "an array of the ips for influxdb"
+  influxdb.ip:
+    description: "the ip for influxdb"
   influxdb.database:
     description: "database name in influxdb to create"
   influxdb.retention:

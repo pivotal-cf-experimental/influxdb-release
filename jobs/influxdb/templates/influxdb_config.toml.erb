@@ -3,7 +3,7 @@ reporting-disabled = false
 # If hostname (on the OS) doesn't return a name that can be resolved by the other
 # systems in the cluster, you'll have to set the hostname to an IP or something
 # that can be resolved here.
-<% localip = p('influxdb.ips')[spec.index]%>
+<% localip = p('influxdb.ip')%>
 
 [meta]
   dir = "/var/vcap/data/influxdb/meta"
