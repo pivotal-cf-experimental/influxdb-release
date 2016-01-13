@@ -10,3 +10,4 @@ config/private.yml
 dev_releases
 pkg
 src/influxdb/bin
+releases/**/*.tgz
