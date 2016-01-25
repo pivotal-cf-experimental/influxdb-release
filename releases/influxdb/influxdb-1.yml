@@ -1,0 +1,22 @@
+---
+packages:
+- name: go
+  version: 643ffd83586a30edafe8c6f8c4c4b06cb25b21b7
+  fingerprint: 643ffd83586a30edafe8c6f8c4c4b06cb25b21b7
+  sha1: dd8fe00c25365bf2c18df145963afaa0cd312cdf
+  dependencies: []
+- name: influxdb
+  version: 5db37de7166d3bcf8a693dd582159bfe52d5708a
+  fingerprint: 5db37de7166d3bcf8a693dd582159bfe52d5708a
+  sha1: 07f4269098058fb41207eecdca59625e327f3693
+  dependencies:
+  - go
+jobs:
+- name: influxdb
+  version: fca7bfe286a18a3d7b67af0f63ba9110367bd8ca
+  fingerprint: fca7bfe286a18a3d7b67af0f63ba9110367bd8ca
+  sha1: d8bdcfe434fb621175016e9a52851e7907a572bb
+commit_hash: 0a72b4e7
+uncommitted_changes: false
+name: influxdb
+version: '1'
