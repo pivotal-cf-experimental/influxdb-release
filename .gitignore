@@ -2,8 +2,9 @@
 .bundle
 .cache
 .dev_builds
-.final_builds
 .idea
+.final_builds/jobs/**/*.tgz
+.final_builds/packages/**/*.tgz
 blobs
 config/dev.yml
 config/private.yml
